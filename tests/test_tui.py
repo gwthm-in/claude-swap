@@ -185,6 +185,7 @@ class FakeSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        base_url: str | None = None,
     ) -> None:
         self.calls.append(("add_token", token, email, slot, assume_yes))
         print(f"Added Account {slot or 9}")

@@ -25,7 +25,12 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
-from claude_swap.models import Platform, get_timestamp, normalize_alias
+from claude_swap.models import (
+    Platform,
+    get_timestamp,
+    normalize_alias,
+    normalize_base_url,
+)
 from claude_swap.oauth import credential_fingerprint
 
 if TYPE_CHECKING:
@@ -95,6 +100,17 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
             normalize_alias(alias)
         except ValueError as e:
             raise TransferError(f"invalid alias for {email}: {e}") from e
+
+    base_url = account.get("baseUrl")
+    if base_url is not None:
+        if not isinstance(base_url, str):
+            raise TransferError(
+                f"baseUrl for {email} must be a string, got {type(base_url).__name__}"
+            )
+        try:
+            normalize_base_url(base_url)
+        except ValueError as e:
+            raise TransferError(f"invalid baseUrl for {email}: {e}") from e
 
     return email, str(raw_number)
 
@@ -255,7 +271,10 @@ def export_accounts(
         # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
+        is_api_key = looks_like_api_key(creds_text) or (
+            record.get("kind") == "api_key"
+            and not creds_text.lstrip().startswith("{")
+        )
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -276,6 +295,8 @@ def export_accounts(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        if record.get("baseUrl"):
+            entry["baseUrl"] = record["baseUrl"]
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -389,10 +410,26 @@ def import_accounts(
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        base_url = (
+            normalize_base_url(raw["baseUrl"]) if raw.get("baseUrl") else None
+        )
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+            # A relay key registered with --base-url carries no sk-ant-api
+            # prefix; any other raw key still has to look like an API key.
+            if not (
+                isinstance(creds_obj, str)
+                and (
+                    looks_like_api_key(creds_obj)
+                    or (
+                        base_url
+                        and creds_obj.strip()
+                        and not creds_obj.lstrip().startswith(("{", "sk-ant-oat"))
+                    )
+                )
+            ):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    + (" (or a raw relay key)" if base_url else "")
                 )
             creds_text = creds_obj.strip()
         else:
@@ -434,6 +471,7 @@ def import_accounts(
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
                 "alias": alias,
+                "base_url": base_url,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }
@@ -567,6 +605,8 @@ def import_accounts(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        if entry.get("base_url"):
+            new_record["baseUrl"] = entry["base_url"]
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

@@ -48,17 +48,22 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import claude_settings, macos_keychain
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import approved_form
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
+    ConfigError,
     CredentialReadError,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
-from claude_swap.models import Platform
-from claude_swap.paths import get_default_global_config_path
+from claude_swap.models import Platform, base_url_host
+from claude_swap.paths import (
+    get_default_claude_settings_path,
+    get_default_global_config_path,
+)
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import atomic_write_json
@@ -568,6 +573,8 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
+        base_url = self.switcher.account_base_url(account_num)
+        key_session = self.switcher._account_kind(account_num) == "api_key"
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
@@ -600,7 +607,10 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                # Environment untouched, as ever; only the endpoint is pinned
+                # (flag settings outrank the shared settings.json).
+                args, _ = self._endpoint_args(claude_args, base_url, share=True)
+                self._exec(claude_bin, args, env=dict(os.environ))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -609,19 +619,133 @@ class SessionManager:
                 f"override the selected account inside Claude Code."
             )
 
-        session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
-        )
+        api_key: str | None = None
+        if key_session:
+            session_dir, api_key = self._setup_key_session(
+                account_num, email, share, share_history
+            )
+        else:
+            session_dir, account_num, email = self.setup_session(
+                identifier, share, share_history
+            )
+        args, endpoint = self._endpoint_args(claude_args, base_url, share)
 
+        endpoint_label = (
+            f" {muted(f'→ {base_url_host(base_url)}')}" if base_url else ""
+        )
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted('[session mode]')}{endpoint_label}"
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        if base_url:
+            env[claude_settings.BASE_URL_ENV] = base_url
+        elif endpoint is not None:
+            env.pop(claude_settings.BASE_URL_ENV, None)
+        if api_key is not None:
+            # Environment, never argv: argv is visible to every process.
+            env["ANTHROPIC_API_KEY"] = api_key
+        self._exec(claude_bin, args, env=env)
+
+    def _endpoint_override(self, base_url: str, share: bool) -> str | None:
+        """The endpoint this launch must pin with ``--settings``, or None.
+
+        A base-URL account always pins its own URL. Any other account pins
+        Anthropic's only when the shared ``settings.json`` it will read
+        carries the ANTHROPIC_BASE_URL cswap set for the default login (a
+        global switch to a base-URL account); a value the user set there
+        themselves is theirs and is left to apply.
+        """
+        if base_url:
+            return base_url
+        if not share:
+            return None
+        try:
+            current = claude_settings.read_base_url(get_default_claude_settings_path())
+        except ConfigError:
+            return None
+        marker = self.switcher._managed_base_url_marker(
+            self.switcher._get_sequence_data() or {}
+        )
+        if current is not None and current == marker:
+            return claude_settings.ANTHROPIC_API_URL
+        return None
+
+    def _endpoint_args(
+        self, claude_args: list[str], base_url: str, share: bool
+    ) -> tuple[list[str], str | None]:
+        """claude args with the endpoint pinned; returns ``(args, pinned_url)``.
+
+        Claude Code applies settings ``env`` over the process environment,
+        and ``--settings`` (flag settings) outranks the user settings.json,
+        so the pin travels as ``--settings '{"env": {...}}'``.
+
+        A ``--settings`` the user passed is merged rather than duplicated:
+        inline JSON gets the key added (a value the user put there for this
+        launch wins). A settings FILE is left untouched and our pin skipped,
+        with a note; the launch is refused when the
+        shared settings.json names another endpoint, since the credential
+        would then go there.
+        """
+        url = self._endpoint_override(base_url, share)
+        if url is None:
+            return list(claude_args), None
+        pin = {claude_settings.BASE_URL_ENV: url}
+        end = claude_args.index("--") if "--" in claude_args else len(claude_args)
+        for i, arg in enumerate(claude_args[:end]):
+            if arg == "--settings" and i + 1 < end:
+                value_index, value, prefix = i + 1, claude_args[i + 1], ""
+            elif arg.startswith("--settings="):
+                value_index, value, prefix = i, arg[len("--settings="):], "--settings="
+            else:
+                continue
+            try:
+                user_settings = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                user_settings = None
+            user_env = (
+                user_settings.get("env", {})
+                if isinstance(user_settings, dict)
+                else None
+            )
+            if not isinstance(user_env, dict):
+                # A settings FILE (or JSON cswap cannot merge into) is passed
+                # through untouched: inlining a file would put whatever it
+                # holds into argv. Safe only while the shared settings.json
+                # does not point this launch somewhere else.
+                shared = None
+                if share:
+                    try:
+                        shared = claude_settings.read_base_url(
+                            get_default_claude_settings_path()
+                        )
+                    except ConfigError:
+                        shared = None
+                if shared is not None and shared != url:
+                    raise SessionError(
+                        "--settings was given as a file, so cswap cannot pin "
+                        f"this launch's endpoint ({base_url_host(url)}), and "
+                        "the shared settings.json points Claude Code at "
+                        f"{base_url_host(shared)} — this account's credential "
+                        f"would be sent there. Set env.{claude_settings.BASE_URL_ENV} "
+                        "in your settings file, or pass --settings as inline JSON."
+                    )
+                print(dimmed(
+                    "--settings was given as a file; cswap left it as is and "
+                    f"did not add its {claude_settings.BASE_URL_ENV} pin."
+                ))
+                return list(claude_args), None
+            if claude_settings.BASE_URL_ENV in user_env:
+                return list(claude_args), None
+            user_env.update(pin)
+            user_settings["env"] = user_env
+            merged = list(claude_args)
+            merged[value_index] = prefix + json.dumps(user_settings)
+            return merged, url
+        return ["--settings", json.dumps({"env": pin}), *claude_args], url
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -658,18 +782,124 @@ class SessionManager:
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
-        """Reject API-key accounts in session mode (not supported yet).
+        """Reject API-key accounts without a custom endpoint in session mode.
 
         Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
         ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an API-key
         account would otherwise fail validation opaquely. Raise early with guidance.
+        A base-URL account (``add-token --base-url``) takes the key-session path
+        instead (``_setup_key_session``): its key travels in the environment.
         """
-        if self.switcher._account_kind(account_num) == "api_key":
+        if self.switcher._account_kind(
+            account_num
+        ) == "api_key" and not self.switcher.account_base_url(account_num):
             raise SessionError(
                 f"Account-{account_num} ({email}) is an API-key account; "
-                "'cswap run' (session mode) does not support API-key accounts yet. "
+                "'cswap run' (session mode) does not support API-key accounts yet "
+                "(only those registered with --base-url). "
                 "Use 'cswap --switch-to' to make it your default login instead."
             )
+
+    def _setup_key_session(
+        self, account_num: str, email: str, share: bool, share_history: bool
+    ) -> tuple[Path, str]:
+        """Prepare the profile of a base-URL API-key account; returns (dir, key).
+
+        No OAuth anywhere: nothing to refresh, and no `claude auth status`
+        probe (it would report an API-key login, which the OAuth validity
+        check reads as invalid). The key itself is handed to claude through
+        ``ANTHROPIC_API_KEY`` by ``run``; the profile only records that key's
+        approval the way ``/login`` would, so claude does not prompt for it.
+        """
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
+        if not creds or not creds.strip():
+            if unreadable:
+                raise SessionError(
+                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"but it is unreadable right now (locked or no GUI "
+                    f"session). Retry from a GUI terminal; do not re-add."
+                )
+            raise SessionError(
+                f"Account-{account_num} has no stored key. Re-add it with: "
+                f"cswap add-token - --base-url URL --slot {account_num}"
+            )
+        key = creds.strip()
+        config_text = self.switcher.read_account_config(account_num, email)
+        try:
+            config_data = json.loads(config_text) if config_text else {}
+        except json.JSONDecodeError:
+            config_data = {}
+        oauth_account = (
+            config_data.get("oauthAccount") if isinstance(config_data, dict) else None
+        )
+        if not oauth_account:
+            raise SessionError(
+                f"Account-{account_num} has no stored config backup. Re-add it "
+                f"with: cswap add-token - --base-url URL --slot {account_num}"
+            )
+        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            self._seed_key_profile(session_dir, oauth_account, key, config_data)
+            if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
+                clear_session_stale(session_dir)
+        self._sync_sharing(session_dir, share, share_history)
+        return session_dir, key
+
+    def _seed_key_profile(
+        self, session_dir: Path, oauth_account: dict, key: str, config_data: dict
+    ) -> None:
+        """Seed identity + key approval into the profile's ``.claude.json``.
+
+        Idempotent and skipped when already current, so a second launch does
+        not rewrite the config under a running claude. A first seed also
+        clears any OAuth credential left at this path (plaintext seed and
+        hashed Keychain entry), so it cannot compete with the key.
+        """
+        approved = approved_form(key)
+        config_path = session_dir / ".claude.json"
+        existing: dict = {}
+        if config_path.exists():
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                existing = loaded if isinstance(loaded, dict) else {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        responses = existing.get("customApiKeyResponses")
+        if not isinstance(responses, dict):
+            responses = {}
+        approved_list = responses.get("approved")
+        if not isinstance(approved_list, list):
+            approved_list = []
+        rejected_list = responses.get("rejected")
+        if not isinstance(rejected_list, list):
+            rejected_list = []
+        current = (
+            existing.get("oauthAccount") == oauth_account
+            and existing.get("hasCompletedOnboarding") is True
+            and approved in approved_list
+            and approved not in rejected_list
+        )
+        if current:
+            return
+
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(session_dir, 0o700)
+        delete_macos_keychain_entry(session_dir)
+        (session_dir / ".credentials.json").unlink(missing_ok=True)
+
+        if approved not in approved_list:
+            approved_list.append(approved)
+        responses["approved"] = approved_list
+        responses["rejected"] = [r for r in rejected_list if r != approved]
+        existing["customApiKeyResponses"] = responses
+        existing["oauthAccount"] = oauth_account
+        existing["hasCompletedOnboarding"] = True
+        existing.setdefault("theme", config_data.get("theme") or "dark")
+        atomic_write_json(config_path, existing)
+        self._logger.info(f"Seeded key session profile at {session_dir}")
 
     # -- bootstrap -------------------------------------------------------
 
@@ -680,6 +910,11 @@ class SessionManager:
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
+        if self.switcher._account_kind(account_num) == "api_key":
+            session_dir, _ = self._setup_key_session(
+                account_num, email, share, share_history
+            )
+            return session_dir, account_num, email
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
         # Deferred invalidation: backup credentials changed while this profile

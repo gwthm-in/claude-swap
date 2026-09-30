@@ -131,6 +131,8 @@ cswap run 2 --require-session   # refuse rather than run plain claude if 2 is th
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
 
 Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
+
+Accounts added with `--base-url` run against their own endpoint in session mode, even while the default login points elsewhere; see [custom endpoints](#add-an-account-from-a-raw-token-or-api-key). cswap passes the endpoint as `--settings '{"env":{"ANTHROPIC_BASE_URL":...}}'`: inline JSON you pass with `--settings` is merged with it (a value you set wins), while a settings *file* is left untouched and the launch is refused if the shared `settings.json` would send the credential elsewhere. Other API-key accounts are not supported in session mode.
   
 A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
 
@@ -347,6 +349,8 @@ A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login 
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
+Accounts registered with `--base-url` carry an additive `baseUrl` on their list row and on the `status --json` active row, with `usageStatus: "custom_endpoint"` and `usage: null`. A switch that changed Claude Code's endpoint adds `"baseUrlChanged": true, "restartRequired": true` to its result.
+
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
 </details>
@@ -366,6 +370,8 @@ cswap add-token sk-ant-api03-...             # managed API key
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
+cswap add-token pool_... --base-url https://relay.example.com   # relay / gateway key
+cswap add-token - --base-url https://relay.example.com --slot 5 # same, key from stdin
 ```
 
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
@@ -376,6 +382,23 @@ cswap add-token --email user@example.com     # optional label override
 setup-token. It switches like any other account; since API keys have no subscription
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
+
+**Custom endpoints (relays, gateways).** `--base-url URL` registers an account that
+talks to a service speaking the Anthropic API instead of Anthropic itself. Any key
+other than an `sk-ant-oat...` setup-token is then stored as an API key, whatever its
+prefix, and Claude Code sends it as one. The URL must be `http(s)://host[:port][/path]`
+(a trailing slash is dropped; `--base-url ""` on an existing account removes it).
+`cswap run N` applies the endpoint to that one process only: the key is passed in
+its environment (`ANTHROPIC_API_KEY`) and the URL through `--settings`. `cswap switch N`
+makes it global by setting `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`
+(written through a symlink, other settings untouched); switching to an ordinary
+account removes it again. cswap only ever changes or removes the value it wrote: if
+you set `ANTHROPIC_BASE_URL` there yourself, switching to a custom-endpoint account is
+refused and switching elsewhere leaves it in place. Claude Code reads that setting at
+startup, so running sessions keep their old endpoint until restarted — the switch
+says so. These accounts show `→ host` in `cswap list`, report no usage (`custom
+endpoint`), and their key is never sent to Anthropic by cswap (no usage or identity
+lookups). They are treated like API-key accounts by auto-switching.
 
 ## Uninstall
 

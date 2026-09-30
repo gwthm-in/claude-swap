@@ -1081,6 +1081,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s add-token pool_... --base-url https://relay.example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
@@ -1146,6 +1147,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "defaults to setup-token-{slot}@token.local (or "
             "api-key-{slot}@token.local for API keys) since these tokens "
             "carry no real email metadata."
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        metavar="URL",
+        help=(
+            "Custom API endpoint (a relay or gateway speaking the Anthropic "
+            "API) for the account (use with 'add-token'). The key is then "
+            "stored as an API key unless it is an sk-ant-oat setup-token; "
+            "'' clears it on an existing account"
         ),
     )
     parser.add_argument(
@@ -1354,6 +1365,17 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
+    if args.base_url is not None and args.add_token is None:
+        parser.error("--base-url can only be used with 'add-token'")
+
+    if args.base_url:
+        from claude_swap.models import normalize_base_url
+
+        try:
+            args.base_url = normalize_base_url(args.base_url)
+        except ValueError as e:
+            parser.error(f"--base-url: {e}")
+
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
 
@@ -1410,10 +1432,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         if args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
+            extra = {} if args.base_url is None else {"base_url": args.base_url}
             switcher.add_account_from_token(
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                **extra,
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)

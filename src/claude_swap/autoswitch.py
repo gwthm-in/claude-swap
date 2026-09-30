@@ -777,7 +777,7 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
-        if self.switcher.account_kind_for(number) == "api_key":
+        if self.switcher.account_is_quotaless(number):
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
@@ -961,7 +961,7 @@ class AutoSwitchEngine:
             self._check_model_names(quarantined, usage)
 
         if (
-            self.switcher.account_kind_for(current) == "api_key"
+            self.switcher.account_is_quotaless(current)
             and not settings.include_api_key_accounts
         ):
             self._emit(
@@ -1057,14 +1057,14 @@ class AutoSwitchEngine:
             if num != current and num not in quarantined
         ]
         oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+            n for n in candidates if not self.switcher.account_is_quotaless(n)
         ]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
         api_key_candidates = (
-            [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
+            [n for n in candidates if self.switcher.account_is_quotaless(n)]
             if settings.include_api_key_accounts
             else []
         )
@@ -2198,7 +2198,7 @@ class AutoSwitchEngine:
             n
             for n in self.switcher.switchable_account_numbers()
             if n not in quarantined
-            and self.switcher.account_kind_for(n) != "api_key"
+            and not self.switcher.account_is_quotaless(n)
         ]
         values = [usage.get(n) for n in relevant]
         readable = [v for v in values if isinstance(v, dict)]

@@ -24,6 +24,10 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
+# Base-URL accounts (``add-token --base-url``) talk to a relay/gateway, not
+# Anthropic: there is no quota to read, and their key must never be sent to
+# Anthropic's usage API, so usage is reported as this sentinel instead.
+USAGE_CUSTOM_ENDPOINT = "custom endpoint"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
@@ -218,6 +222,7 @@ def usage_fields(
     automatically — or a live session's credential refused, which only that
     session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
+    ``USAGE_CUSTOM_ENDPOINT`` sentinel (base-URL account, never fetched), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
@@ -230,6 +235,8 @@ def usage_fields(
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_CUSTOM_ENDPOINT:
+        return "custom_endpoint", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
@@ -318,6 +325,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    base_url: str = "",
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -338,6 +346,9 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field: the custom API endpoint of a base-URL account.
+    if base_url:
+        row["baseUrl"] = base_url
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.

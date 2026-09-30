@@ -26,11 +26,12 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import claude_settings, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
+    USAGE_CUSTOM_ENDPOINT,
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
@@ -60,8 +61,10 @@ from claude_swap.models import (
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
+    base_url_host,
     get_timestamp,
     normalize_alias,
+    normalize_base_url,
 )
 from claude_swap.printer import (
     abbreviate_path,
@@ -78,6 +81,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_settings_path,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -242,6 +246,7 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
+    USAGE_CUSTOM_ENDPOINT: "custom endpoint (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
 }
@@ -282,7 +287,17 @@ def _backoff_note(entry: UsageEntry, now: float) -> str | None:
     return f"{cause}, retries {retry}"
 
 
-def _usage_entry_lines(entry: UsageEntry, now: float | None = None) -> list[str]:
+def sentinel_note(sentinel: str, base_url: str = "") -> str:
+    """The display note for a sentinel state; a custom endpoint names its host."""
+    note = SENTINEL_NOTES.get(sentinel, sentinel)
+    if sentinel == USAGE_CUSTOM_ENDPOINT and base_url:
+        note = f"{note} · {base_url_host(base_url)}"
+    return note
+
+
+def _usage_entry_lines(
+    entry: UsageEntry, now: float | None = None, base_url: str = ""
+) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
@@ -293,9 +308,11 @@ def _usage_entry_lines(entry: UsageEntry, now: float | None = None) -> list[str]
     error, so a failing endpoint is visible instead of a silent blank.
     """
     if entry.sentinel is not None:
-        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        out = [dimmed(sentinel_note(entry.sentinel, base_url))]
         last_seen = last_seen_note(entry)
-        if last_seen is not None and entry.sentinel != USAGE_API_KEY:
+        if last_seen is not None and entry.sentinel not in (
+            USAGE_API_KEY, USAGE_CUSTOM_ENDPOINT
+        ):
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
@@ -802,8 +819,17 @@ class ClaudeAccountSwitcher:
         key = (self._read_json(get_global_config_path()) or {}).get("primaryApiKey")
         return key if isinstance(key, str) else ""
 
-    def _write_credentials(self, credentials: str) -> None:
-        self._store._write_credentials(credentials)
+    def _write_credentials(
+        self, credentials: str, api_key: bool | None = None
+    ) -> None:
+        self._store._write_credentials(credentials, api_key=api_key)
+
+    def _activate_credentials(self, credentials: str, api_key: bool) -> None:
+        """``_write_credentials``, forcing the API-key axis only when asked."""
+        if api_key:
+            self._write_credentials(credentials, api_key=True)
+        else:
+            self._write_credentials(credentials)
 
     def _prepare_credentials_for_activation(
         self, target_credentials: str, live_credentials: str | None
@@ -1830,6 +1856,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    base_url=self._account_base_url(n, seq_data),
                 )
             )
         return AccountsSnapshot(
@@ -2752,7 +2779,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if looks_like_api_key(creds) or self._account_kind(str(num)) == "api_key":
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -3172,6 +3199,246 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num), {})
         return "api_key" if record.get("kind") == "api_key" else "oauth"
 
+    def _account_base_url(
+        self, account_num: str | None, data: dict | None = None
+    ) -> str:
+        """A slot's custom API endpoint (``baseUrl``), or "" for Anthropic."""
+        if account_num is None:
+            return ""
+        if data is None:
+            data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        value = record.get("baseUrl")
+        return value if isinstance(value, str) else ""
+
+    def account_base_url(self, account_num: str) -> str:
+        """Public wrapper: a slot's custom API endpoint, or "" for Anthropic."""
+        return self._account_base_url(account_num)
+
+    def account_is_quotaless(self, account_num: str) -> bool:
+        """Whether a slot has no subscription quota to watch.
+
+        API-key accounts and base-URL accounts (whatever their credential
+        kind) both qualify: neither has usage cswap can read, and a base-URL
+        account's credential must never be sent to Anthropic to find out.
+        """
+        return self._account_kind(account_num) == "api_key" or bool(
+            self._account_base_url(account_num)
+        )
+
+    def _is_api_key_credential(
+        self, credentials: str | None, account_num: str | None
+    ) -> bool:
+        """Whether a live credential belongs on the API-key axis.
+
+        ``looks_like_api_key`` answers for ``sk-ant-api…`` keys. A relay key
+        registered with ``--base-url`` has no such prefix, so a raw (non-JSON)
+        value counts when its slot is stored as an API-key account, or when
+        it is the key Claude Code's managed-key store currently holds.
+        """
+        if looks_like_api_key(credentials):
+            return True
+        if not credentials or credentials.lstrip().startswith("{"):
+            return False
+        if account_num is not None and self._account_kind(account_num) == "api_key":
+            return True
+        return self._store._is_active_managed_key(credentials)
+
+    @staticmethod
+    def _managed_base_url_marker(data: dict) -> str | None:
+        """The ``ANTHROPIC_BASE_URL`` value cswap last wrote to settings.json."""
+        value = (data or {}).get("managedBaseUrl")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _set_managed_base_url_marker(data: dict, value: str | None) -> None:
+        if value:
+            data["managedBaseUrl"] = value
+        else:
+            data.pop("managedBaseUrl", None)
+
+    def _settings_base_url_plan(self, target_url: str, data: dict) -> dict:
+        """Decide what activating an account does to ``env.ANTHROPIC_BASE_URL``.
+
+        Read-only; raises before any mutation when the switch must not go
+        ahead. Ownership is tracked by the ``managedBaseUrl`` marker in
+        ``sequence.json``: cswap only ever changes or removes a value equal
+        to the one it wrote. A different value was put there by the user, and
+        is never overwritten (switching to a base-URL account is refused) or
+        removed (switching to an Anthropic account leaves it, with a warning).
+
+        Returns ``{"action": "set"|"remove"|"none", "value", "current",
+        "marker", "new_marker", "warning"}``.
+        """
+        path = get_claude_settings_path()
+        marker = self._managed_base_url_marker(data)
+        plan: dict = {
+            "action": "none",
+            "value": target_url or None,
+            "current": None,
+            "marker": marker,
+            "new_marker": None,
+            "warning": None,
+        }
+        try:
+            current = claude_settings.read_base_url(path)
+        except ConfigError as e:
+            if target_url:
+                raise SwitchError(
+                    f"This account uses a custom endpoint, which is applied "
+                    f"through {path}, but that file cannot be used: {e}"
+                ) from e
+            plan["new_marker"] = marker
+            if marker:
+                plan["warning"] = (
+                    f"Could not read {path} to remove the ANTHROPIC_BASE_URL "
+                    f"cswap set there ({base_url_host(marker)}); left as is."
+                )
+            return plan
+        plan["current"] = current
+        managed = current is not None and current == marker
+        if target_url:
+            if current is None or managed:
+                plan["action"] = "none" if current == target_url else "set"
+                plan["new_marker"] = target_url
+            elif current == target_url:
+                plan["new_marker"] = None
+            else:
+                raise SwitchError(
+                    f"{path} already sets env.ANTHROPIC_BASE_URL to "
+                    f"{base_url_host(current)}, and cswap did not write it. "
+                    f"Refusing to replace it with this account's endpoint "
+                    f"({base_url_host(target_url)}). Remove it from "
+                    f"{path.name} (or use 'cswap run' for this account), "
+                    f"then retry."
+                )
+        elif current is not None:
+            if managed:
+                plan["action"] = "remove"
+            else:
+                plan["warning"] = (
+                    f"{path} sets env.ANTHROPIC_BASE_URL to "
+                    f"{base_url_host(current)} (not set by cswap); Claude "
+                    f"Code keeps using that endpoint."
+                )
+        return plan
+
+    def _apply_settings_base_url(self, plan: dict) -> bool:
+        """Carry out a planned settings change. Returns whether it wrote.
+
+        Re-reads first: Claude Code writes settings.json on its own, and the
+        plan's ownership verdict only holds for the value it was made on.
+        """
+        if plan["action"] == "none":
+            return False
+        path = get_claude_settings_path()
+        if claude_settings.read_base_url(path) != plan["current"]:
+            raise SwitchError(
+                f"{path} changed while the switch was in progress; retry."
+            )
+        value = plan["value"] if plan["action"] == "set" else None
+        return claude_settings.write_base_url(path, value)
+
+    def _restore_settings_base_url(self, value: str | None) -> None:
+        """Rollback: put ``env.ANTHROPIC_BASE_URL`` back to ``value``."""
+        claude_settings.write_base_url(get_claude_settings_path(), value)
+
+    def _live_credential_is_any_of(
+        self, data: dict, slots: list[str]
+    ) -> bool:
+        """Whether Claude Code's live credential is one of ``slots``' stored ones.
+
+        Byte or lineage-fingerprint equality against each slot's backup (a
+        relay key is compared as-is: the managed-key store returns it raw).
+        An UNREADABLE live store answers True: not knowing whose key is live
+        is no licence to point Claude Code back at Anthropic. Never raises.
+        """
+        try:
+            live = self._read_credentials()
+        except Exception:
+            return True
+        if live is None:
+            return True
+        if not live:
+            return False
+        for num in slots:
+            email = (data.get("accounts", {}).get(str(num)) or {}).get("email", "")
+            if not email:
+                continue
+            try:
+                backup = self._read_account_credentials(str(num), email)
+            except Exception:
+                return True
+            if not backup:
+                continue
+            if live.strip() == backup.strip() or (
+                oauth.credential_fingerprint(live)
+                == oauth.credential_fingerprint(backup)
+            ):
+                return True
+        return False
+
+    def _release_managed_base_url(
+        self, data: dict, owner_slots: list[str], purging: bool = False
+    ) -> tuple[str | None, bool]:
+        """Remove the cswap-managed ``ANTHROPIC_BASE_URL`` from settings.json.
+
+        For ``remove_account`` (of the active base-URL slot) and ``purge``.
+        Only a value still equal to the ``managedBaseUrl`` marker is touched,
+        and only once the live Claude Code credential is no longer one of
+        ``owner_slots``' keys: removing it while the relay key is still the
+        live login would send that key to Anthropic. In that case the URL
+        stays, and so does the marker (``remove``: a later switch to an
+        ordinary account still cleans it up; ``purge`` deletes the marker
+        with the rest of cswap's state, so the user is told to remove the
+        value by hand). Mutates ``data``; never raises.
+
+        Returns ``(message, is_warning)`` — message None when there is
+        nothing to say.
+        """
+        marker = self._managed_base_url_marker(data)
+        if not marker:
+            return None, False
+        path = get_claude_settings_path()
+        try:
+            current = claude_settings.read_base_url(path)
+        except ConfigError as e:
+            data.pop("managedBaseUrl", None)
+            return (
+                f"Could not check ANTHROPIC_BASE_URL ({base_url_host(marker)}) "
+                f"in {path}: {e}"
+            ), True
+        if current != marker:
+            data.pop("managedBaseUrl", None)
+            return None, False
+        if self._live_credential_is_any_of(data, owner_slots):
+            then = (
+                "then delete env.ANTHROPIC_BASE_URL from it by hand (cswap's "
+                "record of it is being purged)"
+                if purging
+                else "and cswap removes it from there on that switch (or "
+                "delete env.ANTHROPIC_BASE_URL by hand after logging in)"
+            )
+            return (
+                f"ANTHROPIC_BASE_URL ({base_url_host(marker)}) was left in "
+                f"{path}: that relay account's key is still Claude Code's live "
+                f"login, and removing the URL would send it to Anthropic. Run "
+                f"'cswap switch <other account>' (or log in to Claude Code), "
+                f"{then}."
+            ), True
+        data.pop("managedBaseUrl", None)
+        try:
+            claude_settings.write_base_url(path, None)
+        except ConfigError as e:
+            return (
+                f"Could not remove ANTHROPIC_BASE_URL ({base_url_host(marker)}) "
+                f"from {path}: {e}"
+            ), True
+        return (
+            f"Removed ANTHROPIC_BASE_URL ({base_url_host(marker)}) from {path}. "
+            f"Restart running Claude Code sessions."
+        ), False
+
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
     ) -> None:
@@ -3287,6 +3554,13 @@ class ClaudeAccountSwitcher:
             )
             return creds
 
+        slot = self._find_account_slot(
+            self._get_sequence_data() or {}, email, org_uuid
+        )
+        if slot is not None and self._account_base_url(slot):
+            # A custom-endpoint account's token is never sent to Anthropic,
+            # so its owner cannot be looked up there.
+            return creds
         token = oauth.extract_access_token(creds)
         if not token:
             return unverified("no access token to resolve")
@@ -3367,7 +3641,7 @@ class ClaudeAccountSwitcher:
         account, corrupting the session-guard / export / collision logic that keys
         off ``kind``. Reject with guidance toward the supported path instead.
         """
-        if looks_like_api_key(creds):
+        if self._store._is_active_managed_key(creds):
             raise ValidationError(
                 "Active login is an API-key account. Add it with "
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
@@ -3804,6 +4078,7 @@ class ClaudeAccountSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        base_url: str | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -3823,9 +4098,20 @@ class ClaudeAccountSwitcher:
             slot:  Slot number to use; auto-assigned when ``None``.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
+            base_url: Custom API endpoint (a relay or gateway speaking the
+                   Anthropic API) the account is used through. With it, any
+                   key that is not an ``sk-ant-oat…`` setup-token is stored as
+                   an API key, whatever its prefix. ``None`` keeps an existing
+                   account's endpoint; ``""`` clears it.
         """
         self._refuse_session_shell()
         import getpass
+
+        if base_url:
+            try:
+                base_url = normalize_base_url(base_url)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
 
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
@@ -3836,14 +4122,41 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        is_api_key = looks_like_api_key(token)
-
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
 
         self._setup_directories()
         self._init_sequence_file()
         self._migrate_org_fields()
+
+        # The endpoint this registration leaves the account with: the one
+        # given, or (when --base-url was not passed) the existing account's,
+        # so re-adding a relay key without repeating the URL keeps its kind.
+        effective_base_url = base_url
+        if effective_base_url is None:
+            existing_num = None
+            roster = self._get_sequence_data() or {}
+            if email:
+                existing_num = self._find_account_slot(roster, email, "")
+            elif slot is not None:
+                occupant = (roster.get("accounts", {}).get(str(slot)) or {}).get(
+                    "email"
+                )
+                if occupant in (
+                    f"api-key-{slot}@token.local",
+                    f"setup-token-{slot}@token.local",
+                ):
+                    existing_num = str(slot)
+            effective_base_url = (
+                self._account_base_url(existing_num) if existing_num else ""
+            )
+
+        # A custom endpoint takes whatever key it issues. Only an sk-ant-oat
+        # value is still an OAuth setup-token there; everything else is sent
+        # as an API key (x-api-key), so it is stored and activated as one.
+        is_api_key = looks_like_api_key(token) or bool(
+            effective_base_url and not token.startswith("sk-ant-oat")
+        )
 
         # Synthesize a placeholder email when one isn't provided. These tokens
         # have no real email metadata, so requiring users to invent one is
@@ -3897,6 +4210,11 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
+            record = seq["accounts"][account_num]
+            if effective_base_url:
+                record["baseUrl"] = effective_base_url
+            else:
+                record.pop("baseUrl", None)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -3953,6 +4271,22 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        # Optional fields the account already carries survive a rebuild onto
+        # its own slot or a move to a new one (mirrors ``add_account``).
+        carried: dict = {}
+        if slot is not None:
+            data = self._get_sequence_data()
+            prior = data.get("accounts", {}).get(account_num) or {}
+            if migrate_from:
+                prior = data["accounts"][migrate_from]
+            elif not (
+                prior.get("email") == email
+                and (prior.get("organizationUuid", "") or "") == ""
+            ):
+                prior = {}
+            if prior.get("alias"):
+                carried["alias"] = prior["alias"]
+
         if displace_slot:
             d_num, d_email, d_org = displace_slot
             self._delete_account_files(d_num, d_email)
@@ -3990,6 +4324,9 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        record.update(carried)
+        if effective_base_url:
+            record["baseUrl"] = effective_base_url
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -4001,9 +4338,14 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+        endpoint = (
+            f" {muted(f'→ {base_url_host(effective_base_url)}')}"
+            if effective_base_url
+            else ""
+        )
         print(
             f"{accent('Added')} Account {account_num}: {email} "
-            f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+            f"{muted('[personal]')} {muted(f'(from {source_label})')}{endpoint}"
         )
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
@@ -4080,6 +4422,12 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
+        # Decided before the backup is deleted: whether the live credential
+        # is this account's key is answered against that backup.
+        endpoint_note: tuple[str | None, bool] = (None, False)
+        if str(active_account) == account_num and account_info.get("baseUrl"):
+            endpoint_note = self._release_managed_base_url(data, [account_num])
+
         # Remove backup files
         self._delete_account_files(account_num, email)
 
@@ -4091,6 +4439,12 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        note, is_warning = endpoint_note
+        if note:
+            if is_warning:
+                warning(note)
+            else:
+                print(dimmed(note))
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
@@ -4724,6 +5078,8 @@ class ClaudeAccountSwitcher:
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
         try:
+            if self._account_base_url(account_num):
+                return  # custom endpoint: its token never goes to Anthropic
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
                 creds_oauth
@@ -4840,6 +5196,10 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self._account_base_url(str(num)):
+            # Relay/gateway account: no quota to read, and its credential
+            # must never be sent to Anthropic's usage API.
+            return USAGE_CUSTOM_ENDPOINT
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5565,6 +5925,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    base_url=self._account_base_url(str(num), seq_data),
                 )
             )
         payload = {
@@ -5629,8 +5990,11 @@ class ClaudeAccountSwitcher:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            base_url = self._account_base_url(str(num), seq_data)
+            if base_url:
+                markers += f" {muted(f'→ {base_url_host(base_url)}')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            for line in _usage_entry_lines(entries[str(num)], base_url=base_url):
                 print(f"     {line}")
 
             if show_token_status:
@@ -5742,6 +6106,8 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
+        if acct.get("baseUrl"):
+            active["baseUrl"] = acct["baseUrl"]
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -5785,15 +6151,19 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
+            base_url = self._account_base_url(account_num, data)
+            endpoint = (
+                f" {muted(f'→ {base_url_host(base_url)}')}" if base_url else ""
+            )
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email} {muted(f'[{tag}]')})"
+                f"({current_email} {muted(f'[{tag}]')}){endpoint}"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry):
+            for line in _usage_entry_lines(entry, base_url=base_url):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
@@ -5836,7 +6206,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -5846,6 +6216,10 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if op.get("baseUrlChanged"):
+            result["baseUrlChanged"] = True
+            result["restartRequired"] = True
+        return result
 
     def _switch_noop(
         self,
@@ -6474,7 +6848,7 @@ class ClaudeAccountSwitcher:
             return result
         data = self._get_sequence_data() or {}
         slot = self._find_account_slot(data, identity[0], identity[1])
-        if slot is None:
+        if slot is None or self._account_base_url(slot, data):
             return result
         backup = self._read_account_credentials(slot, identity[0])
         if backup == live or (
@@ -6867,6 +7241,18 @@ class ClaudeAccountSwitcher:
 
             config_path = self._get_claude_config_path()
 
+            # Custom-endpoint reconciliation is planned before anything is
+            # mutated: a user-owned ANTHROPIC_BASE_URL in settings.json
+            # refuses the switch here, with nothing to roll back.
+            target_base_url = self._account_base_url(target_account, data)
+            target_is_api_key = self._account_kind(target_account) == "api_key"
+            base_url_plan = self._settings_base_url_plan(target_base_url, data)
+            if base_url_plan["warning"]:
+                if emit_output:
+                    warning(base_url_plan["warning"])
+                else:
+                    warnings_out.append(base_url_plan["warning"])
+
             # Direct activation path: there is no live Claude session yet
             # (e.g. right after import), claude-swap has no tracked active
             # account yet (e.g. purge -> add-token -> switch-to while a live
@@ -6966,11 +7352,13 @@ class ClaudeAccountSwitcher:
 
                 creds_written = False
                 config_written = False
+                settings_written = False
                 try:
-                    self._write_credentials(
+                    self._activate_credentials(
                         self._prepare_credentials_for_activation(
                             target_creds, rollback_creds
-                        )
+                        ),
+                        target_is_api_key,
                     )
                     creds_written = True
 
@@ -7015,10 +7403,24 @@ class ClaudeAccountSwitcher:
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
+                    settings_written = self._apply_settings_base_url(base_url_plan)
+
                     data["activeAccountNumber"] = int(target_account)
+                    self._set_managed_base_url_marker(
+                        data, base_url_plan["new_marker"]
+                    )
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
                 except Exception:
+                    if settings_written:
+                        try:
+                            self._restore_settings_base_url(
+                                base_url_plan["current"]
+                            )
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback settings.json: {e}"
+                            )
                     if config_written and rollback_config_text is not None:
                         try:
                             config_path.write_text(
@@ -7032,7 +7434,12 @@ class ClaudeAccountSwitcher:
                             )
                     if creds_written and rollback_creds is not None:
                         try:
-                            self._write_credentials(rollback_creds)
+                            self._activate_credentials(
+                                rollback_creds,
+                                self._is_api_key_credential(
+                                    rollback_creds, current_account
+                                ),
+                            )
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback credentials: {e}"
@@ -7053,14 +7460,19 @@ class ClaudeAccountSwitcher:
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
                     )
                     print()
-                    self._print_switch_followup()
+                    self._print_switch_followup(settings_written, target_base_url)
                     print()
                 self._replan_new_active(
                     target_account,
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                return {
+                    "from": from_ref,
+                    "to": to_ref,
+                    "warnings": warnings_out,
+                    "baseUrlChanged": settings_written,
+                }
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -7092,7 +7504,13 @@ class ClaudeAccountSwitcher:
                 original_account_num=current_account,
                 original_email=current_email,
                 config_path=config_path,
+                original_is_api_key=self._is_api_key_credential(
+                    original_creds, current_account
+                ),
+                original_managed_base_url=base_url_plan["marker"],
+                original_settings_base_url=base_url_plan["current"],
             )
+            settings_written = False
 
             try:
                 # Step 1: Backup current account. Position in ~/.claude.json
@@ -7244,10 +7662,11 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(
+                self._activate_credentials(
                     self._prepare_credentials_for_activation(
                         target_creds, original_creds
-                    )
+                    ),
+                    target_is_api_key,
                 )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
@@ -7280,8 +7699,15 @@ class ClaudeAccountSwitcher:
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
+                # Step 4b: Point Claude Code at the target's API endpoint
+                settings_written = self._apply_settings_base_url(base_url_plan)
+                if settings_written:
+                    transaction.record_step("base_url_written")
+                    self._logger.info("Updated settings.json ANTHROPIC_BASE_URL")
+
                 # Step 5: Update sequence state
                 data["activeAccountNumber"] = int(target_account)
+                self._set_managed_base_url_marker(data, base_url_plan["new_marker"])
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
                 transaction.record_step("sequence_updated")
@@ -7319,18 +7745,29 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
                 print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
             print()
-            self._print_switch_followup()
+            self._print_switch_followup(settings_written, target_base_url)
             print()
         self._replan_new_active(
             target_account,
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref,
+            "to": to_ref,
+            "warnings": warnings_out,
+            "baseUrlChanged": settings_written,
+        }
 
-    def _print_switch_followup(self) -> None:
+    def _print_switch_followup(
+        self, base_url_changed: bool = False, base_url: str = ""
+    ) -> None:
         """Print the note after a successful switch, keyed to where the active
         credential write actually landed.
+
+        When the switch changed Claude Code's API endpoint (settings.json
+        ``env.ANTHROPIC_BASE_URL``), "no restart needed" is no longer true —
+        Claude Code reads that at startup — so a warning replaces the hint.
 
         A restart is never required: Claude Code clears its cached OAuth token when
         ``.credentials.json`` changes (file storage — effective on the next message)
@@ -7339,6 +7776,26 @@ class ClaudeAccountSwitcher:
         The file line also covers macOS when the Keychain was unavailable and the
         switch fell back to the file.
         """
+        if base_url_changed:
+            where = (
+                f"now {base_url_host(base_url)}" if base_url else "back to Anthropic"
+            )
+            running = ""
+            try:
+                sessions, ide_instances = get_running_instances()
+                count = len(sessions) + len(ide_instances)
+                if count:
+                    running = f" ({count} running now)"
+            except Exception:
+                self._logger.debug(
+                    "Failed to detect running instances", exc_info=True
+                )
+            warning(
+                f"Claude Code's API endpoint changed ({where}). Running Claude "
+                f"Code sessions keep their old endpoint until restarted"
+                f"{running} — restart them."
+            )
+            return
         backend = self._last_active_credentials_backend
         if backend is None:
             # No write happened this run; fall back to the routing hint.
@@ -7429,6 +7886,22 @@ class ClaudeAccountSwitcher:
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
         data = self._get_sequence_data()
+        # The ownership marker lives in the directory about to be deleted, so
+        # the settings.json value it vouches for has to be settled first —
+        # while the backups it is checked against still exist.
+        endpoint_warning = None
+        if data:
+            relay_slots = [
+                num for num, acc in data.get("accounts", {}).items()
+                if acc.get("baseUrl")
+            ]
+            note, is_warning = self._release_managed_base_url(
+                data, relay_slots, purging=True
+            )
+            if is_warning:
+                endpoint_warning = note
+            elif note:
+                removed_items.append(note)
         if data:
             for account_num, account_info in data.get("accounts", {}).items():
                 email = account_info.get("email", "")
@@ -7500,5 +7973,9 @@ class ClaudeAccountSwitcher:
                 print(f"  {dimmed('-')} {item}")
         else:
             print(f"\n{dimmed('No claude-swap data found to remove.')}")
+
+        if endpoint_warning:
+            print()
+            warning(endpoint_warning)
 
         print(f"\n{accent('Purge complete.')}")

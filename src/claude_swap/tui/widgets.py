@@ -15,7 +15,12 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap.json_output import USAGE_API_KEY, USAGE_CUSTOM_ENDPOINT
+from claude_swap.models import base_url_host
+
+# Sentinel states that are a property of the account rather than a problem:
+# rendered muted, with no "last seen" line (there is no quota to have seen).
+_QUIET_SENTINELS = (USAGE_API_KEY, USAGE_CUSTOM_ENDPOINT)
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES, elapsed_reset_clock
 from claude_swap.usage_store import STALE_OK_S
@@ -203,6 +208,8 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
+    if acc.base_url:
+        text.append(f"   → {base_url_host(acc.base_url)}", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=palette.muted)
@@ -210,13 +217,14 @@ def account_card_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        marker = "·" if sentinel == USAGE_API_KEY else "⚠"
+        quiet = sentinel in _QUIET_SENTINELS
+        style = palette.muted if quiet else palette.sev_warn
+        marker = "·" if quiet else "⚠"
         text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
         # Same supplementary line `cswap list` prints: the last good
-        # measurement behind the sentinel (API-key accounts have no quota to
-        # have "seen").
-        if sentinel != USAGE_API_KEY:
+        # measurement behind the sentinel (API-key and custom-endpoint
+        # accounts have no quota to have "seen").
+        if not quiet:
             last_seen = data.last_seen_note(acc.usage)
             if last_seen is not None:
                 text.append("\n    ")
@@ -284,7 +292,7 @@ def mini_account_text(
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
+        style = palette.muted if sentinel in _QUIET_SENTINELS else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)
         return text
 

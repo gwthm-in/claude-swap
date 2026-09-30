@@ -77,6 +77,21 @@ def get_default_global_config_path() -> Path:
     return Path.home() / ".claude.json"
 
 
+def get_claude_settings_path() -> Path:
+    """Return Claude Code's user settings file (``<config_home>/settings.json``)."""
+    return get_claude_config_home() / "settings.json"
+
+
+def get_default_claude_settings_path() -> Path:
+    """Return the *default* profile's ``settings.json``, ignoring ``CLAUDE_CONFIG_DIR``.
+
+    Session profiles share this file (see ``session.SHARED_ITEMS``), so the
+    session launcher inspects it rather than whatever profile the invoking
+    shell points at.
+    """
+    return get_default_claude_config_home() / "settings.json"
+
+
 def get_credentials_path() -> Path:
     """Return the path to the Claude credentials file."""
     return get_claude_config_home() / ".credentials.json"

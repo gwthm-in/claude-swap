@@ -364,6 +364,7 @@ class CswapApp(App):
                 email=form.email,
                 slot=form.slot,
                 assume_yes=True,
+                base_url=form.base_url,
             ),
             show_output=True,
         )

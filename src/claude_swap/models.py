@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from claude_swap.usage_store import UsageEntry
 
@@ -45,6 +46,50 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+def normalize_base_url(url: str) -> str:
+    """Validate a custom API endpoint and return it without a trailing slash.
+
+    Shared by ``add-token --base-url``, the TUI/menu-bar forms and import
+    validation so every path enforces identical rules: an ``http``/``https``
+    URL with a host, no embedded credentials (the URL is printed and exported
+    in the clear), and no query or fragment (Claude Code appends its own API
+    path to the base URL). Raises ValueError with a user-facing message.
+    """
+    text = url.strip()
+    if not text:
+        raise ValueError("base URL cannot be empty")
+    if any(ch.isspace() for ch in text):
+        raise ValueError(f"base URL '{url}' must not contain whitespace")
+    try:
+        parts = urlsplit(text)
+        hostname = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as e:
+        raise ValueError(f"base URL '{url}' is not a valid URL: {e}") from e
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"base URL '{url}' must start with http:// or https://")
+    if not hostname:
+        raise ValueError(f"base URL '{url}' has no host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            "base URL must not embed credentials (user:password@host); "
+            "the key is supplied separately"
+        )
+    if parts.query or parts.fragment or text.endswith(("?", "#")):
+        raise ValueError(f"base URL '{url}' must not carry a query or fragment")
+    return text.rstrip("/")
+
+
+def base_url_host(url: str | None) -> str:
+    """The host (and port, when given) of a base URL, for display."""
+    if not url:
+        return ""
+    try:
+        return urlsplit(url).netloc or url
+    except ValueError:
+        return url
 
 
 class Platform(Enum):
@@ -140,6 +185,7 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    base_url: str = ""  # custom API endpoint (relay/gateway); "" for Anthropic
 
     @property
     def display_tag(self) -> str:
@@ -171,6 +217,9 @@ class SwitchTransaction:
     original_email: str
     config_path: Path
     completed_steps: list[str] = field(default_factory=list)
+    original_is_api_key: bool = False
+    original_managed_base_url: str | None = None
+    original_settings_base_url: str | None = None
 
     def record_step(self, step: str) -> None:
         """Record a completed step."""
@@ -185,8 +234,14 @@ class SwitchTransaction:
         success = True
         for step in reversed(self.completed_steps):
             try:
-                if step == "credentials_written":
-                    switcher._write_credentials(self.original_credentials)
+                if step == "base_url_written":
+                    switcher._restore_settings_base_url(
+                        self.original_settings_base_url
+                    )
+                elif step == "credentials_written":
+                    switcher._activate_credentials(
+                        self.original_credentials, self.original_is_api_key
+                    )
                 elif step == "config_written":
                     self.config_path.write_text(
                         self.original_config, encoding="utf-8"
@@ -197,6 +252,10 @@ class SwitchTransaction:
                     data = switcher._get_sequence_data()
                     if data:
                         data["activeAccountNumber"] = int(self.original_account_num)
+                        if self.original_managed_base_url:
+                            data["managedBaseUrl"] = self.original_managed_base_url
+                        else:
+                            data.pop("managedBaseUrl", None)
                         data["lastUpdated"] = get_timestamp()
                         switcher._write_json(switcher.sequence_file, data)
                 switcher._logger.info(f"Rolled back step: {step}")

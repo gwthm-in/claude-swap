@@ -794,12 +794,17 @@ class CredentialStore:
             return False  # best-effort; a down Keychain can't be cleaned now
         return True
 
-    def _write_credentials(self, credentials: str) -> None:
+    def _write_credentials(
+        self, credentials: str, api_key: bool | None = None
+    ) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
 
         Detects the kind from the payload (raw ``sk-ant-api…`` key vs OAuth JSON) and
         mirrors Claude Code's own ``saveApiKey``/``removeApiKey``: activating one axis
         clears the other so a stale credential can't shadow the switch.
+        ``api_key=True`` routes a raw key the prefix check cannot recognize (a
+        relay key registered with ``--base-url``) onto the API-key axis; the
+        caller knows the slot's stored kind, the bytes alone do not say.
 
         - **OAuth** → write the OAuth credential (see ``_write_oauth_credentials``),
           then clear any managed key (Keychain "Claude Code" + ``primaryApiKey``;
@@ -811,11 +816,27 @@ class CredentialStore:
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
-        if looks_like_api_key(credentials):
+        if api_key or (api_key is None and looks_like_api_key(credentials)):
             self._write_managed_credentials(credentials.strip())
         else:
             self._write_oauth_credentials(credentials)
             self._clear_managed_key()
+
+    def _is_active_managed_key(self, credentials: str | None) -> bool:
+        """Whether ``credentials`` is the active managed API key.
+
+        A relay key carries no ``sk-ant-api`` prefix, so the bytes alone do
+        not classify it; where they were read from does. Only a non-JSON value
+        equal to what the managed-key locations hold qualifies. Non-mutating.
+        """
+        if not credentials:
+            return False
+        if looks_like_api_key(credentials):
+            return True
+        text = credentials.strip()
+        if not text or text.startswith("{"):
+            return False
+        return self._read_managed_key() == text
 
     def _write_managed_credentials(self, api_key: str) -> None:
         """Activate a managed API key, then clear OAuth (mutual exclusion).

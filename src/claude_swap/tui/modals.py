@@ -11,6 +11,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
+from claude_swap.models import normalize_base_url
+
 
 class ConfirmModal(ModalScreen[bool]):
     """Yes/No confirmation. Dismisses with True only on explicit confirm.
@@ -63,10 +65,12 @@ class TokenForm:
     token: str
     email: str | None
     slot: int | None
+    base_url: str | None = None
 
 
 class AddTokenModal(ModalScreen["TokenForm | None"]):
-    """Collects a setup-token/API key, optional email label, optional slot.
+    """Collects a setup-token/API key, optional email label, optional slot,
+    optional custom endpoint (base URL).
 
     ←/→ only reach the screen when a Button is focused (a focused Input
     consumes them for cursor movement), so they safely double as button
@@ -84,12 +88,14 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
             yield Label("Add account from token", classes="modal-title")
             yield Static(
                 "OAuth setup-token (sk-ant-oat…) or managed API key "
-                "(sk-ant-api…); the type is auto-detected.",
+                "(sk-ant-api…); the type is auto-detected. With a base URL "
+                "(relay/gateway), any other key is stored as an API key.",
                 classes="modal-body",
             )
             yield Input(password=True, placeholder="token (required)", id="token")
             yield Input(placeholder="email label (optional)", id="email")
             yield Input(placeholder="slot number (optional)", id="slot", type="integer")
+            yield Input(placeholder="base URL (optional, https://…)", id="base-url")
             yield Static("", id="form-error", classes="form-error")
             with Horizontal(classes="modal-buttons"):
                 yield Button("Add", id="add")
@@ -112,6 +118,7 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
         token = self.query_one("#token", Input).value.strip()
         email = self.query_one("#email", Input).value.strip() or None
         slot_raw = self.query_one("#slot", Input).value.strip()
+        base_url_raw = self.query_one("#base-url", Input).value.strip()
         if not token:
             self.query_one("#form-error", Static).update("Token is required.")
             return
@@ -127,7 +134,16 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
             if slot < 1:
                 self.query_one("#form-error", Static).update("Slot must be >= 1.")
                 return
-        self.dismiss(TokenForm(token=token, email=email, slot=slot))
+        base_url: str | None = None
+        if base_url_raw:
+            try:
+                base_url = normalize_base_url(base_url_raw)
+            except ValueError as e:
+                self.query_one("#form-error", Static).update(str(e))
+                return
+        self.dismiss(
+            TokenForm(token=token, email=email, slot=slot, base_url=base_url)
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)

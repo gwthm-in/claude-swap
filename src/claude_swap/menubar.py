@@ -959,14 +959,24 @@ def run(switcher) -> int:
                 return
             token_win = rumps.Window(
                 title="Add account from setup-token",
-                message="Setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                message="Setup token (sk-ant-oat01-…) or API key:",
+                ok="Next", cancel="Cancel", dimensions=(320, 24),
             )
             token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
+            url_win = rumps.Window(
+                title="Add account from setup-token",
+                message="Base URL of a relay/gateway (optional — leave empty for Anthropic):",
+                ok="Add", cancel="Cancel", dimensions=(320, 24),
+            )
+            url_resp = url_win.run()
+            if url_resp.clicked != 1:
+                return
+            base_url = url_resp.text.strip() or None
             if self._guard(lambda: self.switcher.add_account_from_token(
                 token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
+                base_url=base_url,
             )):
                 self.refresh_async()
 
