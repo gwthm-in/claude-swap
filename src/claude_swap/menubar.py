@@ -223,18 +223,56 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
 DEFAULT_COLOUR_THRESHOLD = 80
 WARN_PCT = 50
 
-# (light, dark) sRGB hex per colour key. The light shades are deep enough for
-# text contrast of at least 4.5:1 on a light menu; the dark ones are the bright
-# set for a dark menu bar. "muted" uses the system secondary label colour.
+# (light, dark) sRGB hex per colour key: Apple's increased-contrast (accessible)
+# system colours, so the light shades read on the light vibrant menu and the
+# dark ones on a dark menu bar. "muted" uses the system secondary label colour.
+# The highlighted (hovered) row is drawn plain, without these colours, so its
+# text takes the selected-item colour on the selection background.
 COLOUR_HEX = {
-    "ok": ("1A7F37", "3FB950"),
-    "warn": ("9A6700", "E3B341"),
-    "high": ("CF222E", "F85149"),
-    "stale": ("BC4C00", "F0883E"),
+    "ok": ("248A3D", "30DB5B"),
+    "warn": ("A05A00", "FFD426"),
+    "high": ("D70015", "FF6961"),
+    "stale": ("C93400", "FFB340"),
     "brand": ("C15F3C", "D97757"),  # Claude's terracotta
 }
 
 Span = tuple[str, str | None]
+
+
+class HighlightSwap:
+    """Which rows to retitle as the menu highlight moves.
+
+    Maps a menu item to its (coloured, plain) titles. ``highlight`` and
+    ``close`` return the (item, title) pairs to apply: the previously
+    highlighted row goes back to coloured, the newly highlighted one to plain.
+    Pure bookkeeping, so it is testable without AppKit.
+    """
+
+    def __init__(self):
+        self.titles: dict = {}
+        self.current = None
+
+    def reset(self):
+        self.titles.clear()
+        self.current = None
+
+    def register(self, item, coloured, plain):
+        self.titles[item] = (coloured, plain)
+
+    def highlight(self, item) -> list:
+        ops = []
+        previous, self.current = self.current, item
+        if previous is not None and previous != item and previous in self.titles:
+            ops.append((previous, self.titles[previous][0]))
+        if item is not None and item in self.titles:
+            ops.append((item, self.titles[item][1]))
+        return ops
+
+    def close(self) -> list:
+        previous, self.current = self.current, None
+        if previous is not None and previous in self.titles:
+            return [(previous, self.titles[previous][0])]
+        return []
 
 
 def usage_level(pct: float, threshold: int | float | None) -> str:
@@ -671,6 +709,37 @@ def framework_build_warning(
     )
 
 
+_HIGHLIGHT_DELEGATE_CLS = None
+
+
+def _highlight_delegate_class(AppKit):
+    """NSMenuDelegate that swaps row titles on highlight, defined once per process.
+
+    Objective-C class names are process-global, so a second definition would
+    raise; the class is built on first use and cached.
+    """
+    global _HIGHLIGHT_DELEGATE_CLS
+    if _HIGHLIGHT_DELEGATE_CLS is not None:
+        return _HIGHLIGHT_DELEGATE_CLS
+    import objc
+
+    class CSwapMenuHighlightDelegate(
+        AppKit.NSObject, protocols=[objc.protocolNamed("NSMenuDelegate")]
+    ):
+        def menu_willHighlightItem_(self, menu, item):
+            handler = getattr(self, "on_highlight", None)
+            if handler is not None:
+                handler(item)
+
+        def menuDidClose_(self, menu):
+            handler = getattr(self, "on_close", None)
+            if handler is not None:
+                handler()
+
+    _HIGHLIGHT_DELEGATE_CLS = CSwapMenuHighlightDelegate
+    return _HIGHLIGHT_DELEGATE_CLS
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -742,6 +811,8 @@ def run(switcher) -> int:
             )
         return out
 
+    highlight_delegate_cls = _highlight_delegate_class(AppKit)
+
     class MenuBarApp(rumps.App):
         def __init__(self):
             super().__init__(ICON, quit_button=None)
@@ -765,6 +836,15 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            # NSMenu holds its delegate weakly; this keeps it alive.
+            self._highlight = HighlightSwap()
+            self._menu_delegate = None
+            try:
+                self._menu_delegate = highlight_delegate_cls.alloc().init()
+                self._menu_delegate.on_highlight = self._on_highlight
+                self._menu_delegate.on_close = self._on_menu_close
+            except Exception:
+                self.switcher._logger.debug("menubar highlight delegate failed", exc_info=True)
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -937,11 +1017,40 @@ def run(switcher) -> int:
 
         def _set_item_title(self, item, spans):
             try:
-                item._menuitem.setAttributedTitle_(
-                    attributed(spans, AppKit.NSFont.menuFontOfSize_(0))
-                )
+                font = AppKit.NSFont.menuFontOfSize_(0)
+                coloured = attributed(spans, font)
+                plain = attributed([(text, None) for text, _ in spans], font)
+                item._menuitem.setAttributedTitle_(coloured)
+                self._highlight.register(item._menuitem, coloured, plain)
             except Exception:
                 self.switcher._logger.debug("menubar coloured row failed", exc_info=True)
+
+        def _apply_titles(self, ops):
+            for nsitem, title in ops:
+                try:
+                    nsitem.setAttributedTitle_(title)
+                except Exception:
+                    self.switcher._logger.debug("menubar highlight title failed", exc_info=True)
+
+        def _on_highlight(self, nsitem):
+            try:
+                self._apply_titles(self._highlight.highlight(nsitem))
+            except Exception:
+                self.switcher._logger.debug("menubar highlight failed", exc_info=True)
+
+        def _on_menu_close(self):
+            try:
+                self._apply_titles(self._highlight.close())
+            except Exception:
+                self.switcher._logger.debug("menubar highlight restore failed", exc_info=True)
+
+        def _attach_menu_delegate(self):
+            if self._menu_delegate is None:
+                return
+            try:
+                self.menu._menu.setDelegate_(self._menu_delegate)
+            except Exception:
+                self.switcher._logger.debug("menubar menu delegate failed", exc_info=True)
 
         def rebuild_menu(self):
             threshold = self._threshold() or DEFAULT_COLOUR_THRESHOLD
@@ -975,6 +1084,7 @@ def run(switcher) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            self._highlight.reset()
             account_items = []
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at, stale_note in self.snapshot["accounts"]:
                 row = account_label_spans(
@@ -1008,6 +1118,7 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+            self._attach_menu_delegate()
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")

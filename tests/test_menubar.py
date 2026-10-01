@@ -888,3 +888,44 @@ def test_colour_hex_covers_every_span_key():
     for light, dark in menubar.COLOUR_HEX.values():
         assert len(light) == len(dark) == 6
         int(light, 16), int(dark, 16)
+
+
+def test_highlight_swap_plain_on_highlight_and_restores_previous():
+    swap = menubar.HighlightSwap()
+    a, b = object(), object()
+    swap.register(a, "a-col", "a-plain")
+    swap.register(b, "b-col", "b-plain")
+    assert swap.highlight(a) == [(a, "a-plain")]
+    assert swap.highlight(b) == [(a, "a-col"), (b, "b-plain")]
+    assert swap.highlight(b) == [(b, "b-plain")]
+
+
+def test_highlight_swap_unmapped_and_none_items_only_restore():
+    swap = menubar.HighlightSwap()
+    a, other = object(), object()
+    swap.register(a, "a-col", "a-plain")
+    swap.highlight(a)
+    assert swap.highlight(other) == [(a, "a-col")]
+    assert swap.highlight(None) == []
+    swap.highlight(a)
+    assert swap.highlight(None) == [(a, "a-col")]
+    assert swap.current is None
+
+
+def test_highlight_swap_close_restores_current_once():
+    swap = menubar.HighlightSwap()
+    a = object()
+    swap.register(a, "a-col", "a-plain")
+    swap.highlight(a)
+    assert swap.close() == [(a, "a-col")]
+    assert swap.close() == []
+
+
+def test_highlight_swap_reset_forgets_items_from_previous_menu():
+    swap = menubar.HighlightSwap()
+    a = object()
+    swap.register(a, "a-col", "a-plain")
+    swap.highlight(a)
+    swap.reset()
+    assert swap.close() == []
+    assert swap.highlight(a) == []
