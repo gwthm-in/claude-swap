@@ -880,3 +880,11 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+def test_colour_hex_covers_every_span_key():
+    # Every colour key a span can carry resolves to a colour in the app.
+    assert set(menubar.COLOUR_HEX) | {"muted"} == {"ok", "warn", "high", "stale", "muted", "brand"}
+    for light, dark in menubar.COLOUR_HEX.values():
+        assert len(light) == len(dark) == 6
+        int(light, 16), int(dark, 16)

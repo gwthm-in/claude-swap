@@ -223,6 +223,17 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
 DEFAULT_COLOUR_THRESHOLD = 80
 WARN_PCT = 50
 
+# (light, dark) sRGB hex per colour key. The light shades are deep enough for
+# text contrast of at least 4.5:1 on a light menu; the dark ones are the bright
+# set for a dark menu bar. "muted" uses the system secondary label colour.
+COLOUR_HEX = {
+    "ok": ("1A7F37", "3FB950"),
+    "warn": ("9A6700", "E3B341"),
+    "high": ("CF222E", "F85149"),
+    "stale": ("BC4C00", "F0883E"),
+    "brand": ("C15F3C", "D97757"),  # Claude's terracotta
+}
+
 Span = tuple[str, str | None]
 
 
@@ -698,17 +709,27 @@ def run(switcher) -> int:
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
 
-    colours = {
-        "ok": AppKit.NSColor.systemGreenColor,
-        "warn": AppKit.NSColor.systemYellowColor,
-        "high": AppKit.NSColor.systemRedColor,
-        "stale": AppKit.NSColor.systemOrangeColor,
-        "muted": AppKit.NSColor.secondaryLabelColor,
-        # Claude's brand terracotta (#D97757), for the icon.
-        "brand": lambda: AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
-            0xD9 / 255, 0x77 / 255, 0x57 / 255, 1.0
-        ),
-    }
+    def _srgb(hex_: str):
+        r, g, b = (int(hex_[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        return AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, 1.0)
+
+    def _dynamic(light: str, dark: str):
+        # Resolved per drawing appearance: the dropdown is usually light while
+        # the menu bar over a dark wallpaper is dark, and one fixed colour is
+        # unreadable on one of them.
+        light_c, dark_c = _srgb(light), _srgb(dark)
+
+        def provider(appearance):
+            match = appearance.bestMatchFromAppearancesWithNames_(
+                [AppKit.NSAppearanceNameAqua, AppKit.NSAppearanceNameDarkAqua]
+            )
+            return dark_c if match == AppKit.NSAppearanceNameDarkAqua else light_c
+
+        colour = AppKit.NSColor.colorWithName_dynamicProvider_(None, provider)
+        return lambda: colour
+
+    colours = {key: _dynamic(*pair) for key, pair in COLOUR_HEX.items()}
+    colours["muted"] = AppKit.NSColor.secondaryLabelColor
 
     def attributed(spans, font):
         out = AppKit.NSMutableAttributedString.alloc().init()
