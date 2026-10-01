@@ -3262,13 +3262,22 @@ class ClaudeAccountSwitcher:
 
         Read-only; raises before any mutation when the switch must not go
         ahead. Ownership is tracked by the ``managedBaseUrl`` marker in
-        ``sequence.json``: cswap only ever changes or removes a value equal
-        to the one it wrote. A different value was put there by the user, and
-        is never overwritten (switching to a base-URL account is refused) or
-        removed (switching to an Anthropic account leaves it, with a warning).
+        ``sequence.json``: cswap only ever changes a value equal to the one it
+        wrote. A different value was put there by the user, and is never
+        overwritten (switching to a base-URL account is refused, switching to
+        an Anthropic account leaves it, with a warning). The one exception is
+        Anthropic's own default URL (e.g. left behind by ``purge``): it points
+        nowhere but where Claude Code goes anyway, so a base-URL account takes
+        it over, and an Anthropic account leaves it without a warning.
 
-        Returns ``{"action": "set"|"remove"|"none", "value", "current",
-        "marker", "new_marker", "warning"}``.
+        Switching to an Anthropic account never removes cswap's value: it
+        writes Anthropic's default URL (and owns that) instead, because a
+        running Claude Code picks up a changed value live but keeps the last
+        one it saw when the key is removed. Nothing is written when the key
+        is absent.
+
+        Returns ``{"action": "set"|"none", "value", "current", "marker",
+        "new_marker", "warning"}``.
         """
         path = get_claude_settings_path()
         marker = self._managed_base_url_marker(data)
@@ -3297,8 +3306,9 @@ class ClaudeAccountSwitcher:
             return plan
         plan["current"] = current
         managed = current is not None and current == marker
+        default = claude_settings.is_anthropic_default(current)
         if target_url:
-            if current is None or managed:
+            if current is None or managed or default:
                 plan["action"] = "none" if current == target_url else "set"
                 plan["new_marker"] = target_url
             elif current == target_url:
@@ -3314,8 +3324,11 @@ class ClaudeAccountSwitcher:
                 )
         elif current is not None:
             if managed:
-                plan["action"] = "remove"
-            else:
+                plan["value"] = claude_settings.ANTHROPIC_API_URL
+                plan["new_marker"] = claude_settings.ANTHROPIC_API_URL
+                if current != claude_settings.ANTHROPIC_API_URL:
+                    plan["action"] = "set"
+            elif not default:
                 plan["warning"] = (
                     f"{path} sets env.ANTHROPIC_BASE_URL to "
                     f"{base_url_host(current)} (not set by cswap); Claude "
@@ -3336,12 +3349,27 @@ class ClaudeAccountSwitcher:
             raise SwitchError(
                 f"{path} changed while the switch was in progress; retry."
             )
-        value = plan["value"] if plan["action"] == "set" else None
-        return claude_settings.write_base_url(path, value)
+        return claude_settings.write_base_url(path, plan["value"])
 
     def _restore_settings_base_url(self, value: str | None) -> None:
-        """Rollback: put ``env.ANTHROPIC_BASE_URL`` back to ``value``."""
-        claude_settings.write_base_url(get_claude_settings_path(), value)
+        """Rollback: put ``env.ANTHROPIC_BASE_URL`` back to ``value``.
+
+        Only called after cswap wrote the key during the failed switch. A
+        previous value is restored exactly. A previously ABSENT key is not
+        removed again: a running Claude Code keeps the last URL it saw when
+        the key disappears, so removal would leave live sessions on the
+        failed attempt's endpoint. Anthropic's default URL is written instead
+        and recorded as cswap-managed, so a later switch may replace it.
+        """
+        path = get_claude_settings_path()
+        if value is not None:
+            claude_settings.write_base_url(path, value)
+            return
+        claude_settings.write_base_url(path, claude_settings.ANTHROPIC_API_URL)
+        data = self._get_sequence_data()
+        if data:
+            data["managedBaseUrl"] = claude_settings.ANTHROPIC_API_URL
+            self._write_json(self.sequence_file, data)
 
     def _live_credential_is_any_of(
         self, data: dict, slots: list[str]
@@ -3381,17 +3409,21 @@ class ClaudeAccountSwitcher:
     def _release_managed_base_url(
         self, data: dict, owner_slots: list[str], purging: bool = False
     ) -> tuple[str | None, bool]:
-        """Remove the cswap-managed ``ANTHROPIC_BASE_URL`` from settings.json.
+        """Point the cswap-managed ``ANTHROPIC_BASE_URL`` back at Anthropic.
 
         For ``remove_account`` (of the active base-URL slot) and ``purge``.
-        Only a value still equal to the ``managedBaseUrl`` marker is touched,
-        and only once the live Claude Code credential is no longer one of
-        ``owner_slots``' keys: removing it while the relay key is still the
-        live login would send that key to Anthropic. In that case the URL
-        stays, and so does the marker (``remove``: a later switch to an
-        ordinary account still cleans it up; ``purge`` deletes the marker
-        with the rest of cswap's state, so the user is told to remove the
-        value by hand). Mutates ``data``; never raises.
+        Only a value still equal to the ``managedBaseUrl`` marker is touched.
+        It is set to Anthropic's default URL rather than removed: a running
+        Claude Code picks up a changed value live, but keeps the last one it
+        saw when the key is removed. The default stays cswap-managed
+        (``remove``); ``purge`` deletes the marker with the rest of cswap's
+        state and leaves the default in place, which is harmless.
+
+        Nothing changes while the live Claude Code credential is still one of
+        ``owner_slots``' keys: pointing the URL at Anthropic then would send
+        that key there. The URL stays, and so does the marker (``remove``: a
+        later switch to an ordinary account still resets it; ``purge``: the
+        user is told to change it by hand). Mutates ``data``; never raises.
 
         Returns ``(message, is_warning)`` — message None when there is
         nothing to say.
@@ -3400,6 +3432,7 @@ class ClaudeAccountSwitcher:
         if not marker:
             return None, False
         path = get_claude_settings_path()
+        default = claude_settings.ANTHROPIC_API_URL
         try:
             current = claude_settings.read_base_url(path)
         except ConfigError as e:
@@ -3411,33 +3444,47 @@ class ClaudeAccountSwitcher:
         if current != marker:
             data.pop("managedBaseUrl", None)
             return None, False
+        if current == default:
+            if purging:
+                return (
+                    f"ANTHROPIC_BASE_URL in {path} is left at {default}: that "
+                    f"is Anthropic's default, so it is harmless."
+                ), False
+            return None, False
         if self._live_credential_is_any_of(data, owner_slots):
             then = (
-                "then delete env.ANTHROPIC_BASE_URL from it by hand (cswap's "
-                "record of it is being purged)"
+                f"then set env.ANTHROPIC_BASE_URL in it to {default} by hand "
+                "(cswap's record of it is being purged)"
                 if purging
-                else "and cswap removes it from there on that switch (or "
-                "delete env.ANTHROPIC_BASE_URL by hand after logging in)"
+                else f"and cswap sets it to {default} on that switch (or set "
+                f"env.ANTHROPIC_BASE_URL to {default} by hand after logging in)"
             )
             return (
                 f"ANTHROPIC_BASE_URL ({base_url_host(marker)}) was left in "
                 f"{path}: that relay account's key is still Claude Code's live "
-                f"login, and removing the URL would send it to Anthropic. Run "
-                f"'cswap switch <other account>' (or log in to Claude Code), "
-                f"{then}."
+                f"login, and pointing the URL at Anthropic would send it there. "
+                f"Run 'cswap switch <other account>' (or log in to Claude "
+                f"Code), {then}."
             ), True
-        data.pop("managedBaseUrl", None)
         try:
-            claude_settings.write_base_url(path, None)
+            claude_settings.write_base_url(path, default)
         except ConfigError as e:
             return (
-                f"Could not remove ANTHROPIC_BASE_URL ({base_url_host(marker)}) "
-                f"from {path}: {e}"
+                f"Could not set ANTHROPIC_BASE_URL ({base_url_host(marker)}) "
+                f"in {path} to {default}: {e}"
             ), True
-        return (
-            f"Removed ANTHROPIC_BASE_URL ({base_url_host(marker)}) from {path}. "
-            f"Restart running Claude Code sessions."
-        ), False
+        data["managedBaseUrl"] = default
+        message = (
+            f"Set ANTHROPIC_BASE_URL in {path} to {default} (was "
+            f"{base_url_host(marker)}); running Claude Code sessions use it "
+            f"from their next request."
+        )
+        if purging:
+            message += (
+                " It is left there: that is Anthropic's default, so it is "
+                "harmless."
+            )
+        return message, False
 
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
@@ -6218,6 +6265,7 @@ class ClaudeAccountSwitcher:
         }
         if op.get("baseUrlChanged"):
             result["baseUrlChanged"] = True
+        if op.get("authKindChanged"):
             result["restartRequired"] = True
         return result
 
@@ -7350,6 +7398,10 @@ class ClaudeAccountSwitcher:
                         else:
                             warnings_out.append(msg)
 
+                auth_kind_changed = bool(rollback_creds) and (
+                    self._is_api_key_credential(rollback_creds, current_account)
+                    != target_is_api_key
+                )
                 creds_written = False
                 config_written = False
                 settings_written = False
@@ -7460,7 +7512,9 @@ class ClaudeAccountSwitcher:
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
                     )
                     print()
-                    self._print_switch_followup(settings_written, target_base_url)
+                    self._print_switch_followup(
+                        settings_written, target_base_url, auth_kind_changed
+                    )
                     print()
                 self._replan_new_active(
                     target_account,
@@ -7472,6 +7526,7 @@ class ClaudeAccountSwitcher:
                     "to": to_ref,
                     "warnings": warnings_out,
                     "baseUrlChanged": settings_written,
+                    "authKindChanged": auth_kind_changed,
                 }
 
             current_email, _ = current_identity
@@ -7510,6 +7565,7 @@ class ClaudeAccountSwitcher:
                 original_managed_base_url=base_url_plan["marker"],
                 original_settings_base_url=base_url_plan["current"],
             )
+            auth_kind_changed = transaction.original_is_api_key != target_is_api_key
             settings_written = False
 
             try:
@@ -7745,7 +7801,9 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
                 print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
             print()
-            self._print_switch_followup(settings_written, target_base_url)
+            self._print_switch_followup(
+                settings_written, target_base_url, auth_kind_changed
+            )
             print()
         self._replan_new_active(
             target_account,
@@ -7757,20 +7815,26 @@ class ClaudeAccountSwitcher:
             "to": to_ref,
             "warnings": warnings_out,
             "baseUrlChanged": settings_written,
+            "authKindChanged": auth_kind_changed,
         }
 
     def _print_switch_followup(
-        self, base_url_changed: bool = False, base_url: str = ""
+        self,
+        base_url_changed: bool = False,
+        base_url: str = "",
+        auth_kind_changed: bool = False,
     ) -> None:
         """Print the note after a successful switch, keyed to where the active
         credential write actually landed.
 
-        When the switch changed Claude Code's API endpoint (settings.json
-        ``env.ANTHROPIC_BASE_URL``), "no restart needed" is no longer true —
-        Claude Code reads that at startup — so a warning replaces the hint.
+        A changed API endpoint (settings.json ``env.ANTHROPIC_BASE_URL``) is
+        picked up by running Claude Code sessions on their next request, so
+        it gets a dim line. Moving the default login between an OAuth account
+        and an API key is not known to apply to a running session, so that
+        gets a warning that a restart may be needed, in place of the hint.
 
-        A restart is never required: Claude Code clears its cached OAuth token when
-        ``.credentials.json`` changes (file storage — effective on the next message)
+        Otherwise a restart is never required: Claude Code clears its cached
+        OAuth token when ``.credentials.json`` changes (file storage — effective on the next message)
         or when the macOS Keychain cache TTL (~30s) expires. Both lines are dim
         hints, not warnings; the Keychain line adds that a restart skips the wait.
         The file line also covers macOS when the Keychain was unavailable and the
@@ -7778,22 +7842,18 @@ class ClaudeAccountSwitcher:
         """
         if base_url_changed:
             where = (
-                f"now {base_url_host(base_url)}" if base_url else "back to Anthropic"
+                f"now {base_url_host(base_url)}"
+                if base_url
+                else f"back to {base_url_host(claude_settings.ANTHROPIC_API_URL)}"
             )
-            running = ""
-            try:
-                sessions, ide_instances = get_running_instances()
-                count = len(sessions) + len(ide_instances)
-                if count:
-                    running = f" ({count} running now)"
-            except Exception:
-                self._logger.debug(
-                    "Failed to detect running instances", exc_info=True
-                )
+            print(dimmed(
+                f"Claude Code's API endpoint changed ({where}); running "
+                f"sessions use it from their next request."
+            ))
+        if auth_kind_changed:
             warning(
-                f"Claude Code's API endpoint changed ({where}). Running Claude "
-                f"Code sessions keep their old endpoint until restarted"
-                f"{running} — restart them."
+                "The login type changed (OAuth account vs API key): running "
+                "Claude Code sessions may need a restart to pick it up."
             )
             return
         backend = self._last_active_credentials_backend
@@ -7890,6 +7950,7 @@ class ClaudeAccountSwitcher:
         # the settings.json value it vouches for has to be settled first —
         # while the backups it is checked against still exist.
         endpoint_warning = None
+        endpoint_note = None
         if data:
             relay_slots = [
                 num for num, acc in data.get("accounts", {}).items()
@@ -7900,8 +7961,8 @@ class ClaudeAccountSwitcher:
             )
             if is_warning:
                 endpoint_warning = note
-            elif note:
-                removed_items.append(note)
+            else:
+                endpoint_note = note
         if data:
             for account_num, account_info in data.get("accounts", {}).items():
                 email = account_info.get("email", "")
@@ -7974,6 +8035,9 @@ class ClaudeAccountSwitcher:
         else:
             print(f"\n{dimmed('No claude-swap data found to remove.')}")
 
+        if endpoint_note:
+            print()
+            print(dimmed(endpoint_note))
         if endpoint_warning:
             print()
             warning(endpoint_warning)

@@ -3,7 +3,8 @@
 Covers ``add-token --base-url`` validation and kind selection, the roster's
 ``baseUrl`` field across both add-token paths, the global switch's
 ownership-tracked ``env.ANTHROPIC_BASE_URL`` in Claude Code's settings.json
-(set / change / remove, user-owned values, symlinks, rollback), remove/purge
+(set / change / reset to Anthropic's default, user-owned values, symlinks,
+rollback), the restart note on an OAuth / API-key change, remove/purge
 cleanup, session mode (``cswap run``) env and ``--settings`` pinning, the
 "custom endpoint" usage sentinel with no Anthropic calls, and the JSON /
 list / export-import surfaces.
@@ -275,7 +276,7 @@ class TestSlotRebuild:
 
 
 class TestGlobalSwitch:
-    def test_switch_sets_then_removes(self, temp_home: Path):
+    def test_switch_sets_then_resets_to_default(self, temp_home: Path):
         s = _switcher()
         _seed_pair(s)
         assert _settings_base_url() is None
@@ -283,7 +284,6 @@ class TestGlobalSwitch:
         result = s.switch_to("2", json_output=True)
         assert result["switched"] is True
         assert result["baseUrlChanged"] is True
-        assert result["restartRequired"] is True
         assert _settings_base_url() == URL
         assert s._get_sequence_data()["managedBaseUrl"] == URL
         # The relay key is active on Claude Code's API-key axis.
@@ -292,17 +292,68 @@ class TestGlobalSwitch:
         assert approved_form(POOL_KEY) in cfg["customApiKeyResponses"]["approved"]
         assert not get_credentials_path().exists()
 
+        # Not removed: a running session keeps the last URL it saw when the
+        # key disappears, so cswap writes (and owns) Anthropic's default.
         result = s.switch_to("1", json_output=True)
         assert result["baseUrlChanged"] is True
-        assert _settings_base_url() is None
-        assert "managedBaseUrl" not in s._get_sequence_data()
-        assert "env" not in _settings()
+        assert _settings() == {"env": {BASE_URL_ENV: ANTHROPIC_API_URL}}
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
         cfg = json.loads(get_global_config_path().read_text(encoding="utf-8"))
         assert "primaryApiKey" not in cfg
         live = json.loads(get_credentials_path().read_text(encoding="utf-8"))
         assert live["claudeAiOauth"]["accessToken"] == SETUP_TOKEN
         # The relay slot's backup survived the round trip.
         assert s._read_account_credentials("2", "api-key-2@token.local") == POOL_KEY
+
+    def test_managed_default_replaced_by_later_base_url_switch(
+        self, temp_home: Path
+    ):
+        s = _switcher()
+        _seed_pair(s)
+        s.switch_to("2", json_output=True)
+        s.switch_to("1", json_output=True)
+        assert _settings_base_url() == ANTHROPIC_API_URL
+        result = s.switch_to("2", json_output=True)
+        assert result["baseUrlChanged"] is True
+        assert _settings_base_url() == URL
+        assert s._get_sequence_data()["managedBaseUrl"] == URL
+
+    def test_normal_to_normal_keeps_managed_default(self, temp_home: Path):
+        s = _switcher()
+        _seed_pair(s)
+        s.add_account_from_token("sk-ant-oat01-other", slot=3)
+        s.switch_to("2", json_output=True)
+        s.switch_to("1", json_output=True)
+        before = get_claude_settings_path().read_text(encoding="utf-8")
+        result = s.switch_to("3", json_output=True)
+        assert "baseUrlChanged" not in result
+        assert result["warnings"] == []
+        assert get_claude_settings_path().read_text(encoding="utf-8") == before
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
+
+    def test_no_write_when_never_set(self, temp_home: Path):
+        s = _switcher()
+        _seed_pair(s)
+        s.add_account_from_token("sk-ant-oat01-other", slot=3)
+        path = get_claude_settings_path()
+        path.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        result = s.switch_to("3", json_output=True)
+        assert "baseUrlChanged" not in result
+        assert path.read_text(encoding="utf-8") == before
+        assert "managedBaseUrl" not in s._get_sequence_data()
+
+    def test_user_removed_managed_value_not_rewritten(self, temp_home: Path):
+        s = _switcher()
+        _seed_pair(s)
+        s.switch_to("2", json_output=True)
+        path = get_claude_settings_path()
+        path.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        result = s.switch_to("1", json_output=True)
+        assert "baseUrlChanged" not in result
+        assert path.read_text(encoding="utf-8") == before
+        assert "managedBaseUrl" not in s._get_sequence_data()
 
     def test_switch_between_relays_changes_value(self, temp_home: Path):
         s = _switcher()
@@ -311,6 +362,7 @@ class TestGlobalSwitch:
         s.switch_to("2", json_output=True)
         result = s.switch_to("3", json_output=True)
         assert result["baseUrlChanged"] is True
+        assert "restartRequired" not in result
         assert _settings_base_url() == OTHER_URL
         assert s._get_sequence_data()["managedBaseUrl"] == OTHER_URL
 
@@ -334,7 +386,9 @@ class TestGlobalSwitch:
         s.switch_to("2", json_output=True)
         assert _settings() == {"model": "opus", "env": {"FOO": "1", BASE_URL_ENV: URL}}
         s.switch_to("1", json_output=True)
-        assert _settings() == {"model": "opus", "env": {"FOO": "1"}}
+        assert _settings() == {
+            "model": "opus", "env": {"FOO": "1", BASE_URL_ENV: ANTHROPIC_API_URL},
+        }
 
     def test_user_value_refuses_base_url_switch(self, temp_home: Path):
         s = _switcher()
@@ -368,6 +422,60 @@ class TestGlobalSwitch:
         assert path.read_text(encoding="utf-8") == before
         assert any("not set by cswap" in w for w in result["warnings"])
         assert "baseUrlChanged" not in result
+
+    @pytest.mark.parametrize(
+        "default", [ANTHROPIC_API_URL, ANTHROPIC_API_URL + "/"]
+    )
+    def test_user_set_default_left_alone_without_warning(
+        self, temp_home: Path, default
+    ):
+        s = _switcher()
+        s.add_account_from_token(SETUP_TOKEN, slot=1)
+        s.add_account_from_token("sk-ant-oat01-other", slot=2)
+        s.switch_to("1", json_output=True)
+        path = get_claude_settings_path()
+        path.write_text(
+            json.dumps({"env": {BASE_URL_ENV: default}}), encoding="utf-8"
+        )
+        before = path.read_text(encoding="utf-8")
+        result = s.switch_to("2", json_output=True)
+        assert path.read_text(encoding="utf-8") == before
+        assert result["warnings"] == []
+        assert "managedBaseUrl" not in s._get_sequence_data()
+
+    @pytest.mark.parametrize(
+        "default",
+        [ANTHROPIC_API_URL, ANTHROPIC_API_URL + "/", "HTTPS://API.Anthropic.com"],
+    )
+    def test_unmarked_default_is_taken_over(self, temp_home: Path, default):
+        s = _switcher()
+        _seed_pair(s)
+        get_claude_settings_path().write_text(
+            json.dumps({"model": "opus", "env": {BASE_URL_ENV: default}}),
+            encoding="utf-8",
+        )
+        result = s.switch_to("2", json_output=True)
+        assert result["baseUrlChanged"] is True
+        assert _settings() == {"model": "opus", "env": {BASE_URL_ENV: URL}}
+        assert s._get_sequence_data()["managedBaseUrl"] == URL
+        s.switch_to("1", json_output=True)
+        assert _settings_base_url() == ANTHROPIC_API_URL
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
+
+    @pytest.mark.parametrize(
+        "foreign",
+        ["https://api.anthropic.com.evil.example", "https://api.anthropic.com/v2"],
+    )
+    def test_near_default_value_still_refused(self, temp_home: Path, foreign):
+        s = _switcher()
+        _seed_pair(s)
+        path = get_claude_settings_path()
+        path.write_text(json.dumps({"env": {BASE_URL_ENV: foreign}}), encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        with pytest.raises(SwitchError, match="cswap did not write it"):
+            s.switch_to("2", json_output=True)
+        assert path.read_text(encoding="utf-8") == before
+        assert "managedBaseUrl" not in s._get_sequence_data()
 
     def test_user_replaced_managed_value_is_not_removed(self, temp_home: Path):
         s = _switcher()
@@ -416,22 +524,73 @@ class TestGlobalSwitch:
 
         s.switch_to("1", json_output=True)
         assert link.is_symlink()
-        assert json.loads(target.read_text(encoding="utf-8")) == {"theme": "dark"}
+        assert json.loads(target.read_text(encoding="utf-8")) == {
+            "theme": "dark", "env": {BASE_URL_ENV: ANTHROPIC_API_URL},
+        }
 
-    def test_human_followup_warns_restart(self, temp_home: Path, capsys):
+
+class TestRestartNote:
+    """URL changes apply live; only an OAuth <-> API-key change may not."""
+
+    def test_oauth_to_api_key_and_back_flags_restart(self, temp_home: Path):
+        s = _switcher()
+        _seed_pair(s)
+        assert s.switch_to("2", json_output=True)["restartRequired"] is True
+        assert s.switch_to("1", json_output=True)["restartRequired"] is True
+
+    def test_plain_api_key_without_base_url_flags_restart(self, temp_home: Path):
+        s = _switcher()
+        s.add_account_from_token(SETUP_TOKEN, slot=1)
+        s.add_account_from_token(API_KEY, slot=2)
+        s.switch_to("1", json_output=True)
+        result = s.switch_to("2", json_output=True)
+        assert result["restartRequired"] is True
+        assert "baseUrlChanged" not in result
+
+    def test_url_change_without_kind_change_no_restart(self, temp_home: Path):
+        s = _switcher()
+        s.add_account_from_token(SETUP_TOKEN, slot=1)
+        s.add_account_from_token(SETUP_TOKEN + "x", slot=2, base_url=URL)
+        s.switch_to("1", json_output=True)
+        result = s.switch_to("2", json_output=True)
+        assert result["baseUrlChanged"] is True
+        assert "restartRequired" not in result
+        result = s.switch_to("1", json_output=True)
+        assert result["baseUrlChanged"] is True
+        assert "restartRequired" not in result
+
+    def test_direct_activation_flags_kind_change(self, temp_home: Path):
+        s = _switcher()
+        _seed_pair(s)
+        result = s.switch_to("2", json_output=True, force=True)
+        assert result["restartRequired"] is True
+
+    def test_human_kind_change_warns_restart(self, temp_home: Path, capsys):
         s = _switcher()
         _seed_pair(s)
         capsys.readouterr()
-        with patch(
-            "claude_swap.switcher.get_running_instances", return_value=([1, 2], [])
-        ):
-            s.switch_to("2")
+        s.switch_to("2")
         out = capsys.readouterr()
         text = out.out + out.err
-        assert "endpoint changed" in text
-        assert "until restarted" in text
-        assert "(2 running now)" in text
+        assert "endpoint changed (now relay.example.com)" in text
+        assert "next request" in text
+        assert "may need a restart" in text
+        assert "until restarted" not in text
         assert "no restart needed" not in text
+
+    def test_human_url_change_only_no_restart_warning(
+        self, temp_home: Path, capsys
+    ):
+        s = _switcher()
+        s.add_account_from_token(SETUP_TOKEN, slot=1)
+        s.add_account_from_token(SETUP_TOKEN + "x", slot=2, base_url=URL)
+        s.switch_to("2", json_output=True)
+        capsys.readouterr()
+        s.switch_to("1")
+        out = capsys.readouterr()
+        text = out.out + out.err
+        assert "endpoint changed (back to api.anthropic.com)" in text
+        assert "may need a restart" not in text
 
 
 class TestSwitchRollback:
@@ -447,9 +606,32 @@ class TestSwitchRollback:
         monkeypatch.setattr(s, "_set_managed_base_url_marker", boom)
         with pytest.raises(SwitchError, match="rolled back"):
             s.switch_to("2", json_output=True)
-        assert _settings() == {"model": "opus"}
+        # The key was absent, but removing it again would leave running
+        # sessions on the failed attempt's URL: the default is written.
+        assert _settings() == {
+            "model": "opus", "env": {BASE_URL_ENV: ANTHROPIC_API_URL},
+        }
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
         live = json.loads(get_credentials_path().read_text(encoding="utf-8"))
         assert live["claudeAiOauth"]["accessToken"] == SETUP_TOKEN
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_rollback_restores_managed_default_exactly(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _switcher()
+        _seed_pair(s)
+        s.switch_to("2", json_output=True)
+        s.switch_to("1", json_output=True)
+
+        def boom(data, value):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(s, "_set_managed_base_url_marker", boom)
+        with pytest.raises(SwitchError, match="rolled back"):
+            s.switch_to("2", json_output=True)
+        assert _settings_base_url() == ANTHROPIC_API_URL
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
     def test_rollback_restores_relay_key_on_api_key_axis(
@@ -466,6 +648,7 @@ class TestSwitchRollback:
         with pytest.raises(SwitchError, match="rolled back"):
             s.switch_to("1", json_output=True)
         assert _settings_base_url() == URL
+        assert s._get_sequence_data()["managedBaseUrl"] == URL
         cfg = json.loads(get_global_config_path().read_text(encoding="utf-8"))
         assert cfg["primaryApiKey"] == POOL_KEY
         assert not get_credentials_path().exists()
@@ -481,7 +664,29 @@ class TestSwitchRollback:
         monkeypatch.setattr(s, "_set_managed_base_url_marker", boom)
         with pytest.raises(OSError):
             s.switch_to("2", json_output=True)
-        assert _settings_base_url() is None
+        assert _settings_base_url() == ANTHROPIC_API_URL
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
+
+    def test_direct_branch_restores_previous_value_exactly(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _switcher()
+        s.add_account_from_token(POOL_KEY, slot=2, base_url=URL)
+        get_claude_settings_path().write_text(
+            json.dumps({"env": {BASE_URL_ENV: OTHER_URL}}), encoding="utf-8"
+        )
+        data = s._get_sequence_data()
+        data["managedBaseUrl"] = OTHER_URL
+        s._write_json(s.sequence_file, data)
+
+        def boom(data, value):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(s, "_set_managed_base_url_marker", boom)
+        with pytest.raises(OSError):
+            s.switch_to("2", json_output=True)
+        assert _settings_base_url() == OTHER_URL
+        assert s._get_sequence_data()["managedBaseUrl"] == OTHER_URL
 
 
 def _log_in_elsewhere(s: ClaudeAccountSwitcher) -> None:
@@ -508,22 +713,25 @@ class TestRemoveAndPurge:
         assert "cswap switch" in out
         assert POOL_KEY not in out
 
-        # A later switch to an ordinary account still cleans it up.
+        # A later switch to an ordinary account still resets it.
         s.switch_to("1", json_output=True)
-        assert _settings_base_url() is None
-        assert "managedBaseUrl" not in s._get_sequence_data()
+        assert _settings_base_url() == ANTHROPIC_API_URL
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
 
-    def test_remove_after_login_elsewhere_removes_url(
+    def test_remove_after_login_elsewhere_writes_default(
         self, temp_home: Path, capsys
     ):
         s = _switcher()
         _seed_pair(s)
         s.switch_to("2", json_output=True)
         _log_in_elsewhere(s)
+        capsys.readouterr()
         s.remove_account("2", assume_yes=True)
-        assert _settings_base_url() is None
-        assert "managedBaseUrl" not in s._get_sequence_data()
-        assert "Removed ANTHROPIC_BASE_URL" in capsys.readouterr().out
+        assert _settings() == {"env": {BASE_URL_ENV: ANTHROPIC_API_URL}}
+        assert s._get_sequence_data()["managedBaseUrl"] == ANTHROPIC_API_URL
+        out = capsys.readouterr().out
+        assert "Set ANTHROPIC_BASE_URL" in out
+        assert "restart" not in out.lower()
 
     def test_remove_with_unreadable_live_store_keeps_url(
         self, temp_home: Path, monkeypatch
@@ -575,11 +783,11 @@ class TestRemoveAndPurge:
         assert not s.backup_dir.exists()
         out = capsys.readouterr().out
         assert "still Claude Code's live login" in out
-        assert "by hand" in out
+        assert f"to {ANTHROPIC_API_URL} by hand" in out
         assert POOL_KEY not in out
 
-    def test_purge_after_login_elsewhere_removes_url(
-        self, temp_home: Path, monkeypatch
+    def test_purge_after_login_elsewhere_leaves_default(
+        self, temp_home: Path, monkeypatch, capsys
     ):
         s = _switcher()
         _seed_pair(s)
@@ -589,9 +797,50 @@ class TestRemoveAndPurge:
             json.dumps({"model": "opus", "env": {BASE_URL_ENV: URL}}), encoding="utf-8"
         )
         monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+        capsys.readouterr()
         s.purge()
-        assert _settings() == {"model": "opus"}
+        assert _settings() == {
+            "model": "opus", "env": {BASE_URL_ENV: ANTHROPIC_API_URL},
+        }
         assert not s.backup_dir.exists()
+        out = capsys.readouterr().out
+        assert "harmless" in out
+        assert "by hand" not in out
+
+    def test_purge_then_add_relay_and_switch(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _switcher()
+        _seed_pair(s)
+        s.switch_to("2", json_output=True)
+        _log_in_elsewhere(s)
+        monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+        s.purge()
+        assert _settings_base_url() == ANTHROPIC_API_URL
+
+        s = _switcher()
+        _seed_pair(s)
+        assert "managedBaseUrl" not in s._get_sequence_data()
+        result = s.switch_to("2", json_output=True)
+        assert result["switched"] is True
+        assert _settings_base_url() == URL
+        assert s._get_sequence_data()["managedBaseUrl"] == URL
+
+    def test_purge_with_managed_default_leaves_it(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        s = _switcher()
+        _seed_pair(s)
+        s.switch_to("2", json_output=True)
+        s.switch_to("1", json_output=True)
+        before = get_claude_settings_path().read_text(encoding="utf-8")
+        monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+        capsys.readouterr()
+        s.purge()
+        assert get_claude_settings_path().read_text(encoding="utf-8") == before
+        out = capsys.readouterr().out
+        assert f"left at {ANTHROPIC_API_URL}" in out
+        assert "harmless" in out
 
 
 # ---------------------------------------------------------------------------

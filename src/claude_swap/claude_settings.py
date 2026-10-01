@@ -64,6 +64,14 @@ def base_url_from_settings(data: dict | None) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def is_anthropic_default(value: str | None) -> bool:
+    """Whether ``value`` is Anthropic's default API URL (trailing slash and
+    case ignored)."""
+    if not value:
+        return False
+    return value.strip().rstrip("/").lower() == ANTHROPIC_API_URL
+
+
 def read_base_url(path: Path) -> str | None:
     """The configured ``env.ANTHROPIC_BASE_URL``; raises ConfigError when unreadable."""
     return base_url_from_settings(read_settings(path))

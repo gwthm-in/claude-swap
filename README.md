@@ -349,7 +349,7 @@ A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login 
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
-Accounts registered with `--base-url` carry an additive `baseUrl` on their list row and on the `status --json` active row, with `usageStatus: "custom_endpoint"` and `usage: null`. A switch that changed Claude Code's endpoint adds `"baseUrlChanged": true, "restartRequired": true` to its result.
+Accounts registered with `--base-url` carry an additive `baseUrl` on their list row and on the `status --json` active row, with `usageStatus: "custom_endpoint"` and `usage: null`. A switch that changed Claude Code's endpoint adds `"baseUrlChanged": true` to its result, and one that moved the default login between an OAuth account and an API key adds `"restartRequired": true`.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
@@ -391,11 +391,18 @@ prefix, and Claude Code sends it as one. The URL must be `http(s)://host[:port][
 `cswap run N` applies the endpoint to that one process only: the key is passed in
 its environment (`ANTHROPIC_API_KEY`) and the URL through `--settings`. `cswap switch N`
 makes it global by setting `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`
-(written through a symlink, other settings untouched); switching to an ordinary
-account removes it again. cswap only ever changes or removes the value it wrote: if
-you set `ANTHROPIC_BASE_URL` there yourself, switching to a custom-endpoint account is
-refused and switching elsewhere leaves it in place. Claude Code reads that setting at
-startup, so running sessions keep their old endpoint until restarted — the switch
+(written through a symlink, other settings untouched). Running Claude Code sessions
+pick up a changed URL on their next request, no restart needed. Switching back to an
+ordinary account sets it to `https://api.anthropic.com` rather than removing it:
+removing the key does not move a running session back, it keeps the last URL it saw.
+If you never used a custom endpoint, nothing is written. `settings.json` is the only
+file Claude Code reads this from (not `settings.local.json`), so if yours is a
+symlink into a dotfiles repository, expect this key to change there. cswap only
+ever changes the value it wrote: if you set `ANTHROPIC_BASE_URL` there yourself,
+switching to a custom-endpoint account is refused and switching elsewhere leaves it
+in place. The exception is `https://api.anthropic.com` itself (for example, left
+behind by `cswap purge`): a custom-endpoint account takes it over. Switching between an OAuth login and an API key (in either direction) may
+need running sessions to be restarted to pick up the new login type — the switch
 says so. These accounts show `→ host` in `cswap list`, report no usage (`custom
 endpoint`), and their key is never sent to Anthropic by cswap (no usage or identity
 lookups). They are treated like API-key accounts by auto-switching.
