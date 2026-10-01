@@ -403,8 +403,8 @@ switching to a custom-endpoint account is refused and switching elsewhere leaves
 in place. The exception is `https://api.anthropic.com` itself (for example, left
 behind by `cswap purge`): a custom-endpoint account takes it over. Switching between an OAuth login and an API key (in either direction) may
 need running sessions to be restarted to pick up the new login type — the switch
-says so. These accounts show `→ host` in `cswap list`, report no usage (`custom
-endpoint`), and their key is never sent to Anthropic by cswap (no usage or identity
+says so. These accounts show `→ host` in `cswap list` and read `metered` instead of usage
+(`usageStatus: "custom_endpoint"` in JSON), and their key is never sent to Anthropic by cswap (no usage or identity
 lookups). They are treated like API-key accounts by auto-switching.
 
 ## Uninstall
