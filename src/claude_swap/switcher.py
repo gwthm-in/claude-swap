@@ -282,6 +282,28 @@ def _backoff_note(entry: UsageEntry, now: float) -> str | None:
     return f"{cause}, retries {retry}"
 
 
+def usage_stale_note(entry: UsageEntry, now: float) -> str | None:
+    """"3h ago · rate-limited, retries 15:21" for a measurement served stale.
+
+    None unless the entry renders a measurement older than
+    ``_USAGE_AGE_NOTE_S``. Public: the menu bar appends the same note to its
+    account rows, so both surfaces flag an old reading identically.
+    """
+    if (
+        entry.sentinel is not None
+        or entry.last_good is None
+        or entry.age_s is None
+        or entry.age_s <= _USAGE_AGE_NOTE_S
+        or entry.fetched_at is None
+    ):
+        return None
+    note = format_age(int(entry.fetched_at * 1000))
+    backoff = _backoff_note(entry, now)
+    if backoff is not None:
+        note += f" · {backoff}"
+    return note
+
+
 def _usage_entry_lines(entry: UsageEntry, now: float | None = None) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -301,16 +323,9 @@ def _usage_entry_lines(entry: UsageEntry, now: float | None = None) -> list[str]
     if entry.last_good is not None:
         now = time.time() if now is None else now
         lines = _format_usage_lines(entry.last_good, entry.fetched_at, now)
-        if (
-            lines
-            and entry.age_s is not None
-            and entry.age_s > _USAGE_AGE_NOTE_S
-            and entry.fetched_at is not None
-        ):
-            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-            backoff = _backoff_note(entry, now)
-            if backoff is not None:
-                lines[-1] += f" · {backoff}"
+        stale = usage_stale_note(entry, now)
+        if lines and stale is not None:
+            lines[-1] += f" · {stale}"
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
