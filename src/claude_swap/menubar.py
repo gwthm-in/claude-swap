@@ -410,9 +410,10 @@ def title_spans(
 
     Same text as ``format_title``; each percentage is coloured by its level,
     or ``stale`` for an old reading, and a ``--`` placeholder is ``muted``.
+    The icon is ``brand`` (Claude's terracotta).
     """
     if active_email is None:
-        return [(ICON, None)]
+        return [(ICON, "brand")]
     if now is None:
         now = time.time()
     mark = "~" if stale else ""
@@ -444,8 +445,8 @@ def title_spans(
                     (f"{mark}{p:.0f}%", _pct_colour(p, threshold, stale)),
                 ])
     if not segments:
-        return [(ICON, None)]
-    return [(f"{ICON} ", None), *_join_parts(segments)]
+        return [(ICON, "brand")]
+    return [(f"{ICON} ", "brand"), *_join_parts(segments)]
 
 
 def format_title(
@@ -703,6 +704,10 @@ def run(switcher) -> int:
         "high": AppKit.NSColor.systemRedColor,
         "stale": AppKit.NSColor.systemOrangeColor,
         "muted": AppKit.NSColor.secondaryLabelColor,
+        # Claude's brand terracotta (#D97757), for the icon.
+        "brand": lambda: AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+            0xD9 / 255, 0x77 / 255, 0x57 / 255, 1.0
+        ),
     }
 
     def attributed(spans, font):
@@ -928,8 +933,7 @@ def run(switcher) -> int:
                 threshold=threshold,
             )
             self.title = "".join(text for text, _ in spans)
-            if self.title != ICON:
-                self._set_status_title(spans)
+            self._set_status_title(spans)
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh

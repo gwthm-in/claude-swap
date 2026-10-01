@@ -778,7 +778,7 @@ def test_title_spans_colours_each_pct():
         "scoped": [{"name": "Fable", "pct": 95.0}],
     }
     spans = menubar.title_spans("eng@x.com", usage, s, _NOW, threshold=90)
-    assert [(t, k) for t, k in spans if k is not None] == [
+    assert [(t, k) for t, k in spans if k is not None] == [(f"{menubar.ICON} ", "brand"),
         ("20%", "ok"), ("70%", "warn"), ("95%", "high"),
     ]
     assert "".join(t for t, _ in spans) == menubar.format_title("eng@x.com", usage, s, _NOW)
@@ -788,21 +788,21 @@ def test_title_spans_stale_is_orange():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     usage = {"five_hour": {"pct": 1.0}, "seven_day": {"pct": 99.0}}
     spans = menubar.title_spans("a@x.com", usage, s, _NOW, stale=True, threshold=80)
-    assert [(t, k) for t, k in spans if k is not None] == [("~1%", "stale"), ("~99%", "stale")]
+    assert [(t, k) for t, k in spans if k is not None] == [(f"{menubar.ICON} ", "brand"), ("~1%", "stale"), ("~99%", "stale")]
 
 
 def test_title_spans_elapsed_five_hour_muted():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     usage = {"five_hour": {"pct": 92.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 60.0}}
     spans = menubar.title_spans("a@x.com", usage, s, _NOW, threshold=80)
-    assert [(t, k) for t, k in spans if k is not None] == [("--", "muted"), ("60%", "warn")]
+    assert [(t, k) for t, k in spans if k is not None] == [(f"{menubar.ICON} ", "brand"), ("--", "muted"), ("60%", "warn")]
 
 
 def test_title_spans_icon_only_is_uncoloured():
     s = menubar.MenuBarSettings()
-    assert menubar.title_spans(None, None, s, _NOW) == [(menubar.ICON, None)]
+    assert menubar.title_spans(None, None, s, _NOW) == [(menubar.ICON, "brand")]
     off = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    assert menubar.title_spans("a@x.com", _USAGE, off, _NOW) == [(menubar.ICON, None)]
+    assert menubar.title_spans("a@x.com", _USAGE, off, _NOW) == [(menubar.ICON, "brand")]
 
 
 # --- run() app glue ------------------------------------------------------------
