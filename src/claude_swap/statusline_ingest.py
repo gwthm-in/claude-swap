@@ -38,6 +38,15 @@ WEEKLY_RESET_TOLERANCE_S = 3600.0
 WEEK_S = 7 * 86400.0
 
 
+
+# While the statusline keeps feeding an account, no collector fetches it: the
+# usage endpoint's budget is per account and shared with every other client
+# (Orca, Claude Code's own panels), and a near-threshold poll cadence alone can
+# exhaust it. The feed renews this at most once a minute, so the hold lapses,
+# and ordinary polling resumes, about five minutes after the account's
+# sessions go quiet.
+FEED_HOLD_S = 300.0
+
 def _is_number(value: object) -> bool:
     return (
         isinstance(value, (int, float))
@@ -264,7 +273,9 @@ def ingest_statusline(switcher: ClaudeAccountSwitcher, text: str) -> str | None:
         return None
 
     usage = _merge_carried(usage, last_good, now)
-    adopted = switcher._usage_store.adopt({num: (usage, 0.0)}, identities, hold_s=None)
+    adopted = switcher._usage_store.adopt(
+        {num: (usage, 0.0)}, identities, hold_s=FEED_HOLD_S
+    )
     if num not in adopted:
         log.debug("statusline ingest: slot %s already has a newer reading", num)
         return None

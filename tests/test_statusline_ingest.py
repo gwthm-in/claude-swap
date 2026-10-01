@@ -13,7 +13,7 @@ import pytest
 
 from claude_swap import cli
 from claude_swap.session import session_dir_for
-from claude_swap.statusline_ingest import ingest_statusline
+from claude_swap.statusline_ingest import FEED_HOLD_S, ingest_statusline
 from claude_swap.switcher import usage_stale_note
 from claude_swap.usage_store import FetchRecord
 from tests.test_transfer import _linux_switcher, _seed_account
@@ -95,6 +95,19 @@ class TestAttribution:
         assert "countdown" in entry.last_good["seven_day"]
         assert entry.age_s == pytest.approx(0.0, abs=5)
         assert _entry(s, "1", ALICE).last_good is None
+
+    def test_an_adopted_reading_holds_cswaps_own_polling(
+        self, two_accounts, temp_home: Path
+    ):
+        s = two_accounts
+        _login_as(temp_home, BOB)
+
+        assert ingest_statusline(s, _payload(five=80, seven=74)) == "2"
+
+        entry = _entry(s, "2", BOB)
+        assert entry.held_until is not None
+        assert entry.held(time.time())
+        assert entry.held_until <= time.time() + FEED_HOLD_S + 5
 
     def test_session_profile_maps_to_its_own_slot(
         self, two_accounts, temp_home: Path, monkeypatch

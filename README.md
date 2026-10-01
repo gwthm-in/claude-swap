@@ -319,6 +319,8 @@ The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is ma
 
 Claude Code passes its statusline command the live 5-hour and 7-day usage of the account that served the last reply (`rate_limits` in the statusline JSON). It costs no request, so it keeps the active account's usage current even while cswap's own polling of that account is rate-limited. `cswap ingest-statusline` reads that JSON on stdin and records it for the account it belongs to: a `cswap run` session's own account, otherwise the current login. It never prints anything and always exits 0.
 
+While the feed keeps arriving, cswap stops fetching that account itself: each reading holds its own polling for 5 minutes. The usage endpoint's budget is per account and shared with every client that reads it (other tools, Claude Code's `/usage`), so the account that is in use is exactly the one whose budget runs out. Polling resumes on its own about 5 minutes after the account's sessions go quiet. Per-model limits and spend are not in the statusline JSON, so they keep their last fetched values while the hold is on.
+
 Hand the statusline's input to it in the background, so the statusline itself never waits:
 
 ```python
