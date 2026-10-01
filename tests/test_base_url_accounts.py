@@ -1177,7 +1177,7 @@ class TestSurfaces:
         s.list_accounts()
         out = capsys.readouterr().out
         assert "→ relay.example.com" in out
-        assert "custom endpoint (no quota) · relay.example.com" in out
+        assert "metered · relay.example.com" in out
         assert POOL_KEY not in out
 
     def test_status_json(self, temp_home: Path):

@@ -929,3 +929,10 @@ def test_highlight_swap_reset_forgets_items_from_previous_menu():
     swap.reset()
     assert swap.close() == []
     assert swap.highlight(a) == []
+
+
+def test_display_name_hides_placeholder_email_behind_alias():
+    assert menubar.display_name("api-key-4@token.local", "justin-pool") == "justin-pool"
+    assert menubar.display_name("api-key-4@token.local", None) == "api-key-4@token.local"
+    assert menubar.display_name("a@x.com", "work") == "work  (a@x.com)"
+    assert menubar.display_name("a@x.com", None) == "a@x.com"

@@ -402,7 +402,7 @@ def account_label_spans(
     A stale row (``stale_note`` set) shows every percentage and the appended
     note in ``stale``; a disabled row is ``muted`` throughout.
     """
-    label = f"{alias}  ({email})" if alias else email
+    label = display_name(email, alias)
     marker = "  (disabled)" if disabled else ""
     spans: list[Span] = [(f"{num}  {label}{marker}  ", None)]
     spans.extend(
@@ -436,6 +436,21 @@ def format_account_label(
             num, email, usage, now, alias, disabled, fetched_at, stale_note
         )
     )
+
+
+PLACEHOLDER_EMAIL_DOMAIN = "@token.local"
+
+
+def display_name(email: str, alias: str | None) -> str:
+    """An account's menu name: ``alias  (email)``, or just the alias when the
+    email is cswap's ``…@token.local`` placeholder for a token or key added
+    without one (it identifies nothing, so it is only noise next to an alias).
+    """
+    if not alias:
+        return email
+    if email.endswith(PLACEHOLDER_EMAIL_DOMAIN):
+        return alias
+    return f"{alias}  ({email})"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -1133,7 +1148,7 @@ def run(switcher) -> int:
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
             for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, _stale in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+                label = f"{num}  {display_name(email, alias)}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
@@ -1143,7 +1158,7 @@ def run(switcher) -> int:
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
             for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, _stale in accounts:
-                name = f"{alias}  ({email})" if alias else email
+                name = display_name(email, alias)
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
                 )
