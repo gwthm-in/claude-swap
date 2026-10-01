@@ -220,6 +220,106 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
+DEFAULT_COLOUR_THRESHOLD = 80
+WARN_PCT = 50
+
+Span = tuple[str, str | None]
+
+
+def usage_level(pct: float, threshold: int | float | None) -> str:
+    """Colour key for a usage percentage: ``ok`` / ``warn`` / ``high``.
+
+    ``high`` at or above the auto-switch ``threshold`` (80 when it is 0 or
+    unavailable), ``warn`` from 50%, ``ok`` below that.
+    """
+    limit = threshold if threshold and threshold > 0 else DEFAULT_COLOUR_THRESHOLD
+    if pct >= limit:
+        return "high"
+    if pct >= WARN_PCT:
+        return "warn"
+    return "ok"
+
+
+def _pct_colour(pct: float, threshold, stale: bool) -> str:
+    return "stale" if stale else usage_level(pct, threshold)
+
+
+def _join_parts(parts: list[list[Span]], sep: str = " · ") -> list[Span]:
+    out: list[Span] = []
+    for i, part in enumerate(parts):
+        if i:
+            out.append((sep, None))
+        out.extend(part)
+    return out
+
+
+def usage_summary_spans(
+    usage: dict | str | None,
+    now: float | None = None,
+    fetched_at: float | None = None,
+    threshold: int | float | None = None,
+    stale: bool = False,
+) -> list[Span]:
+    """``usage_summary`` as coloured ``(text, colour_key)`` spans.
+
+    Each percentage is coloured by its own level (``usage_level``), or
+    ``stale`` when the reading is old; ``--`` placeholders are ``muted``;
+    labels, countdowns and markers carry no colour.
+    """
+    if isinstance(usage, str):
+        return [(usage, None)]
+    if usage is None:
+        return [("usage unavailable", None)]
+    if now is None:
+        now = time.time()
+    parts: list[list[Span]] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        pace_result = None
+        if key == "seven_day":
+            window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
+            # Pace against the rolled window, not the raw one: a stale window
+            # rolled to 0% has no current-cycle data to compare against, so
+            # its (correctly zeroed) pct naturally never reads as "ahead" —
+            # computing pace pre-roll would otherwise pair last cycle's high
+            # pct with this cycle's freshly-reset 0% display.
+            pace_result = pace.compute_pace(window, fetched_at=fetched_at)
+        elif isinstance(window, dict) and elapsed_reset_clock(window, now) is not None:
+            parts.append([(f"{label} ", None), ("--", "muted")])
+            continue
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            pct = window["pct"]
+            seg: list[Span] = [(f"{label} ", None), (f"{pct:.0f}%", _pct_colour(pct, threshold, stale))]
+            if key == "seven_day" and pace_result and pace_result.ahead:
+                seg.append((" (ahead)", None))
+            countdown = _live_countdown(window, now)
+            if countdown:
+                seg.append((f" ({countdown})", None))  # time until this window resets
+            parts.append(seg)
+    # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
+    for window in usage.get("scoped") or []:
+        window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
+        pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+            pct = window["pct"]
+            seg = [(f"{window['name']} ", None), (f"{pct:.0f}%", _pct_colour(pct, threshold, stale))]
+            if pct >= 100:
+                seg.append((" (!)", None))  # maxed model — the usual reason to switch
+            elif pace_result and pace_result.ahead:
+                seg.append((" (ahead)", None))
+            countdown = _live_countdown(window, now)
+            if countdown:
+                seg.append((f" ({countdown})", None))
+            parts.append(seg)
+    spend = usage.get("spend")
+    if isinstance(spend, dict) and elapsed_reset_clock(spend, now) is not None:
+        parts.append([("$ ", None), ("--", "muted")])
+    elif isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+        pct = spend["pct"]
+        parts.append([("$ ", None), (f"{pct:.0f}%", _pct_colour(pct, threshold, stale))])
+    return _join_parts(parts) if parts else [("usage unavailable", None)]
+
+
 def usage_summary(
     usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
 ) -> str:
@@ -234,55 +334,36 @@ def usage_summary(
     as the CLI's ``switcher.elapsed_reset_clock``. Weekly windows instead roll
     forward on their fixed cadence (``_rolled_weekly_window``).
     """
-    if isinstance(usage, str):
-        return usage
-    if usage is None:
-        return "usage unavailable"
-    if now is None:
-        now = time.time()
-    parts: list[str] = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        window = usage.get(key)
-        pace_result = None
-        if key == "seven_day":
-            window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
-            # Pace against the rolled window, not the raw one: a stale window
-            # rolled to 0% has no current-cycle data to compare against, so
-            # its (correctly zeroed) pct naturally never reads as "ahead" —
-            # computing pace pre-roll would otherwise pair last cycle's high
-            # pct with this cycle's freshly-reset 0% display.
-            pace_result = pace.compute_pace(window, fetched_at=fetched_at)
-        elif isinstance(window, dict) and elapsed_reset_clock(window, now) is not None:
-            parts.append(f"{label} --")
-            continue
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            seg = f"{label} {window['pct']:.0f}%"
-            if key == "seven_day" and pace_result and pace_result.ahead:
-                seg += " (ahead)"
-            countdown = _live_countdown(window, now)
-            if countdown:
-                seg += f" ({countdown})"  # time until this window resets
-            parts.append(seg)
-    # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
-    for window in usage.get("scoped") or []:
-        window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
-        pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-            seg = f"{window['name']} {window['pct']:.0f}%"
-            if window["pct"] >= 100:
-                seg += " (!)"  # maxed model — the usual reason to switch
-            elif pace_result and pace_result.ahead:
-                seg += " (ahead)"
-            countdown = _live_countdown(window, now)
-            if countdown:
-                seg += f" ({countdown})"
-            parts.append(seg)
-    spend = usage.get("spend")
-    if isinstance(spend, dict) and elapsed_reset_clock(spend, now) is not None:
-        parts.append("$ --")
-    elif isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-        parts.append(f"$ {spend['pct']:.0f}%")
-    return " · ".join(parts) if parts else "usage unavailable"
+    return "".join(text for text, _ in usage_summary_spans(usage, now, fetched_at))
+
+
+def account_label_spans(
+    num,
+    email: str,
+    usage: dict | str | None,
+    now: float | None = None,
+    alias: str | None = None,
+    disabled: bool = False,
+    fetched_at: float | None = None,
+    stale_note: str | None = None,
+    threshold: int | float | None = None,
+) -> list[Span]:
+    """One account row's menu label as coloured ``(text, colour_key)`` spans.
+
+    A stale row (``stale_note`` set) shows every percentage and the appended
+    note in ``stale``; a disabled row is ``muted`` throughout.
+    """
+    label = f"{alias}  ({email})" if alias else email
+    marker = "  (disabled)" if disabled else ""
+    spans: list[Span] = [(f"{num}  {label}{marker}  ", None)]
+    spans.extend(
+        usage_summary_spans(usage, now, fetched_at, threshold, stale=stale_note is not None)
+    )
+    if stale_note:
+        spans.append((f" · {stale_note}", "stale"))
+    if disabled:
+        spans = [(text, "muted") for text, _ in spans]
+    return spans
 
 
 def format_account_label(
@@ -300,12 +381,12 @@ def format_account_label(
     ``stale_note`` (from ``switcher.usage_stale_note``) is appended when the
     reading is old, e.g. ``· 3h ago · rate-limited, retries 15:21``.
     """
-    label = f"{alias}  ({email})" if alias else email
-    marker = "  (disabled)" if disabled else ""
-    summary = usage_summary(usage, now, fetched_at)
-    if stale_note:
-        summary += f" · {stale_note}"
-    return f"{num}  {label}{marker}  {summary}"
+    return "".join(
+        text
+        for text, _ in account_label_spans(
+            num, email, usage, now, alias, disabled, fetched_at, stale_note
+        )
+    )
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -314,6 +395,57 @@ def _local_part(email: str, limit: int = 12) -> str:
     if len(local) > limit:
         return local[: limit - 1] + "*"
     return local
+
+
+def title_spans(
+    active_email: str | None,
+    active_usage: dict | str | None,
+    settings: MenuBarSettings,
+    now: float | None = None,
+    alias: str | None = None,
+    stale: bool = False,
+    threshold: int | float | None = None,
+) -> list[Span]:
+    """The menu-bar title as coloured ``(text, colour_key)`` spans.
+
+    Same text as ``format_title``; each percentage is coloured by its level,
+    or ``stale`` for an old reading, and a ``--`` placeholder is ``muted``.
+    """
+    if active_email is None:
+        return [(ICON, None)]
+    if now is None:
+        now = time.time()
+    mark = "~" if stale else ""
+    segments: list[list[Span]] = []
+    if settings.show_account_name:
+        segments.append([(alias if alias else _local_part(active_email), None)])
+    if settings.title_pct in ("5h", "both"):
+        five = active_usage.get("five_hour") if isinstance(active_usage, dict) else None
+        p = _window_pct(active_usage, "five_hour")
+        if isinstance(five, dict) and elapsed_reset_clock(five, now) is not None:
+            segments.append([("--", "muted")])
+        elif p is not None:
+            segments.append([(f"{mark}{p:.0f}%", _pct_colour(p, threshold, stale))])
+    if settings.title_pct in ("7d", "both"):
+        seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
+        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
+        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
+        if p is not None:
+            segments.append([(f"{mark}{p:.0f}%", _pct_colour(p, threshold, stale))])
+    if settings.title_scoped and isinstance(active_usage, dict):
+        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
+        # dropdown rows; named so multiple scoped models stay distinguishable.
+        for window in active_usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+                p = window["pct"]
+                segments.append([
+                    (f"{window['name']} ", None),
+                    (f"{mark}{p:.0f}%", _pct_colour(p, threshold, stale)),
+                ])
+    if not segments:
+        return [(ICON, None)]
+    return [(f"{ICON} ", None), *_join_parts(segments)]
 
 
 def format_title(
@@ -332,37 +464,9 @@ def format_title(
     be old. A 5h window whose reset has passed shows ``--`` rather than its
     obsolete pct (kept as a placeholder so "both" stays positional).
     """
-    if active_email is None:
-        return ICON
-    if now is None:
-        now = time.time()
-    mark = "~" if stale else ""
-    segments: list[str] = []
-    if settings.show_account_name:
-        segments.append(alias if alias else _local_part(active_email))
-    if settings.title_pct in ("5h", "both"):
-        five = active_usage.get("five_hour") if isinstance(active_usage, dict) else None
-        p = _window_pct(active_usage, "five_hour")
-        if isinstance(five, dict) and elapsed_reset_clock(five, now) is not None:
-            segments.append("--")
-        elif p is not None:
-            segments.append(f"{mark}{p:.0f}%")
-    if settings.title_pct in ("7d", "both"):
-        seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
-        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
-        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
-        if p is not None:
-            segments.append(f"{mark}{p:.0f}%")
-    if settings.title_scoped and isinstance(active_usage, dict):
-        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
-        # dropdown rows; named so multiple scoped models stay distinguishable.
-        for window in active_usage.get("scoped") or []:
-            window = _rolled_weekly_window(window, now)
-            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
-                segments.append(f"{window['name']} {mark}{window['pct']:.0f}%")
-    if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+    return "".join(
+        text for text, _ in title_spans(active_email, active_usage, settings, now, alias, stale)
+    )
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -593,6 +697,25 @@ def run(switcher) -> int:
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
 
+    colours = {
+        "ok": AppKit.NSColor.systemGreenColor,
+        "warn": AppKit.NSColor.systemYellowColor,
+        "high": AppKit.NSColor.systemRedColor,
+        "stale": AppKit.NSColor.systemOrangeColor,
+        "muted": AppKit.NSColor.secondaryLabelColor,
+    }
+
+    def attributed(spans, font):
+        out = AppKit.NSMutableAttributedString.alloc().init()
+        for text, key in spans:
+            attrs = {AppKit.NSFontAttributeName: font}
+            if key is not None:
+                attrs[AppKit.NSForegroundColorAttributeName] = colours[key]()
+            out.appendAttributedString_(
+                AppKit.NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+            )
+        return out
+
     class MenuBarApp(rumps.App):
         def __init__(self):
             super().__init__(ICON, quit_button=None)
@@ -771,14 +894,42 @@ def run(switcher) -> int:
                 return 0
 
         # ---- menu construction -----------------------------------------------
+        def _set_status_title(self, spans):
+            """Colour the status-bar title; the plain title stays if this fails."""
+            item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+            if item is None:
+                return
+            try:
+                title = attributed(spans, AppKit.NSFont.menuBarFontOfSize_(0))
+                button = item.button() if hasattr(item, "button") else None
+                if button is not None:
+                    button.setAttributedTitle_(title)
+                else:
+                    item.setAttributedTitle_(title)
+            except Exception:
+                self.switcher._logger.debug("menubar coloured title failed", exc_info=True)
+
+        def _set_item_title(self, item, spans):
+            try:
+                item._menuitem.setAttributedTitle_(
+                    attributed(spans, AppKit.NSFont.menuFontOfSize_(0))
+                )
+            except Exception:
+                self.switcher._logger.debug("menubar coloured row failed", exc_info=True)
+
         def rebuild_menu(self):
-            self.title = format_title(
+            threshold = self._threshold() or DEFAULT_COLOUR_THRESHOLD
+            spans = title_spans(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
                 stale=self.snapshot.get("active_stale", False),
+                threshold=threshold,
             )
+            self.title = "".join(text for text, _ in spans)
+            if self.title != ICON:
+                self._set_status_title(spans)
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh
@@ -801,13 +952,15 @@ def run(switcher) -> int:
             self.menu.clear()
             account_items = []
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at, stale_note in self.snapshot["accounts"]:
+                row = account_label_spans(
+                    num, email, display, alias=alias, disabled=disabled,
+                    fetched_at=fetched_at, stale_note=stale_note, threshold=threshold,
+                )
                 item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled,
-                        fetched_at=fetched_at, stale_note=stale_note,
-                    ),
+                    "".join(text for text, _ in row),
                     callback=self._make_switch_to(num),
                 )
+                self._set_item_title(item, row)
                 item.state = 1 if is_active else 0
                 account_items.append(item)
             if not account_items:

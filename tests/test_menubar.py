@@ -681,6 +681,130 @@ def test_format_title_weekly_roll_forward_unchanged_with_reset_5h():
     assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ -- · 0%"
 
 
+# --- usage colouring -----------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "pct, expected",
+    [(0, "ok"), (49, "ok"), (49.9, "ok"), (50, "warn"), (89, "warn"), (90, "high"), (100, "high")],
+)
+def test_usage_level_boundaries(pct, expected):
+    assert menubar.usage_level(pct, 90) == expected
+
+
+def test_usage_level_falls_back_to_80_without_threshold():
+    for threshold in (0, None):
+        assert menubar.usage_level(79, threshold) == "warn"
+        assert menubar.usage_level(80, threshold) == "high"
+
+
+def test_account_label_spans_fresh_row_colours_each_window():
+    usage = {
+        "five_hour": {"pct": 42.0},
+        "seven_day": {"pct": 85.0},
+        "scoped": [{"name": "Fable", "pct": 60.0}],
+        "spend": {"pct": 90.0},
+    }
+    spans = menubar.account_label_spans(2, "a@x.com", usage, _NOW, threshold=85)
+    assert [(t, k) for t, k in spans if k is not None] == [
+        ("42%", "ok"), ("85%", "high"), ("60%", "warn"), ("90%", "high"),
+    ]
+    assert all(k is None for t, k in spans if "%" not in t)
+
+
+def test_account_label_spans_stale_row_turns_pcts_and_note_orange():
+    usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0}}
+    note = "3h ago · rate-limited, retries 15:21"
+    spans = menubar.account_label_spans(
+        1, "a@x.com", usage, _NOW, stale_note=note, threshold=80
+    )
+    coloured = [(t, k) for t, k in spans if k is not None]
+    assert coloured == [("10%", "stale"), ("95%", "stale"), (f" · {note}", "stale")]
+
+
+def test_account_label_spans_elapsed_five_hour_dashes_muted():
+    usage = {
+        "five_hour": {"pct": 92.0, "resets_at": _iso(-60)},
+        "seven_day": {"pct": 30.0},
+        "spend": {"pct": 30.0, "resets_at": _iso(-60)},
+    }
+    spans = menubar.account_label_spans(1, "a@x.com", usage, _NOW, threshold=80)
+    assert [(t, k) for t, k in spans if k is not None] == [
+        ("--", "muted"), ("30%", "ok"), ("--", "muted"),
+    ]
+
+
+def test_account_label_spans_disabled_row_all_muted():
+    spans = menubar.account_label_spans(
+        1, "a@x.com", _USAGE, _NOW, disabled=True, stale_note="3h ago", threshold=80
+    )
+    assert spans and all(k == "muted" for _, k in spans)
+
+
+def test_account_label_spans_string_usage_default_colour():
+    spans = menubar.account_label_spans(1, "a@x.com", "usage unavailable", _NOW)
+    assert all(k is None for _, k in spans)
+    spans = menubar.account_label_spans(1, "a@x.com", None, _NOW)
+    assert all(k is None for _, k in spans)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"alias": "dev"},
+        {"disabled": True},
+        {"stale_note": "3h ago · rate-limited, retries 15:21"},
+        {"fetched_at": _NOW},
+    ],
+)
+def test_account_label_spans_join_equals_format_account_label(kwargs):
+    usage = {
+        "five_hour": {"pct": 92.0, "resets_at": _iso(-60)},
+        "seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)},
+        "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(3600)}],
+        "spend": {"pct": 30.0},
+    }
+    spans = menubar.account_label_spans(3, "a@x.com", usage, _NOW, threshold=80, **kwargs)
+    assert "".join(t for t, _ in spans) == menubar.format_account_label(
+        3, "a@x.com", usage, _NOW, **kwargs
+    )
+
+
+def test_title_spans_colours_each_pct():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_scoped=True)
+    usage = {
+        "five_hour": {"pct": 20.0},
+        "seven_day": {"pct": 70.0},
+        "scoped": [{"name": "Fable", "pct": 95.0}],
+    }
+    spans = menubar.title_spans("eng@x.com", usage, s, _NOW, threshold=90)
+    assert [(t, k) for t, k in spans if k is not None] == [
+        ("20%", "ok"), ("70%", "warn"), ("95%", "high"),
+    ]
+    assert "".join(t for t, _ in spans) == menubar.format_title("eng@x.com", usage, s, _NOW)
+
+
+def test_title_spans_stale_is_orange():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    usage = {"five_hour": {"pct": 1.0}, "seven_day": {"pct": 99.0}}
+    spans = menubar.title_spans("a@x.com", usage, s, _NOW, stale=True, threshold=80)
+    assert [(t, k) for t, k in spans if k is not None] == [("~1%", "stale"), ("~99%", "stale")]
+
+
+def test_title_spans_elapsed_five_hour_muted():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    usage = {"five_hour": {"pct": 92.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 60.0}}
+    spans = menubar.title_spans("a@x.com", usage, s, _NOW, threshold=80)
+    assert [(t, k) for t, k in spans if k is not None] == [("--", "muted"), ("60%", "warn")]
+
+
+def test_title_spans_icon_only_is_uncoloured():
+    s = menubar.MenuBarSettings()
+    assert menubar.title_spans(None, None, s, _NOW) == [(menubar.ICON, None)]
+    off = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    assert menubar.title_spans("a@x.com", _USAGE, off, _NOW) == [(menubar.ICON, None)]
+
+
 # --- run() app glue ------------------------------------------------------------
 
 def test_run_without_rumps_raises_clean_error(monkeypatch):
