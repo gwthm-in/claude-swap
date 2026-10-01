@@ -315,6 +315,35 @@ The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is ma
 
 </details>
 
+### Feed usage from Claude Code's statusline
+
+Claude Code passes its statusline command the live 5-hour and 7-day usage of the account that served the last reply (`rate_limits` in the statusline JSON). It costs no request, so it keeps the active account's usage current even while cswap's own polling of that account is rate-limited. `cswap ingest-statusline` reads that JSON on stdin and records it for the account it belongs to: a `cswap run` session's own account, otherwise the current login. It never prints anything and always exits 0.
+
+Hand the statusline's input to it in the background, so the statusline itself never waits:
+
+```python
+#!/usr/bin/env python3
+import json, shutil, subprocess, sys
+
+raw = sys.stdin.read()
+data = json.loads(raw)
+# ... print your statusline from `data` here ...
+cswap = shutil.which("cswap")
+if cswap and data.get("rate_limits"):
+    p = subprocess.Popen([cswap, "ingest-statusline"], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    p.stdin.write(raw.encode())
+    p.stdin.close()
+```
+
+<details>
+<summary>What it records, and what it refuses</summary>
+
+The statusline reports only the 5-hour and 7-day windows; per-model weekly limits and spend are carried over from the account's last reading until cswap's own next fetch replaces them. API-key and base-URL accounts are skipped. A reading is refused within 90 seconds of an account switch (a reply the previous account served can still arrive), and when its weekly reset time differs by more than an hour from the one stored for that account (weekly resets are fixed per account, so the figures are someone else's). A reading older than the one already stored never replaces it. Throttle the hand-over if many sessions run at once: once a minute is plenty.
+
+</details>
+
 ### JSON output for scripting
 
 Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.

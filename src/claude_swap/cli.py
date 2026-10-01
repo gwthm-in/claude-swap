@@ -62,6 +62,7 @@ _SUBCOMMAND_FLAGS = {
     "export": "--export",
     "import": "--import",
     "import-usage": "--import-usage",
+    "ingest-statusline": "--ingest-statusline",
     "purge": "--purge",
     "upgrade": "--upgrade",
     "update": "--upgrade",
@@ -1063,6 +1064,7 @@ Commands:
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s import-usage <path>        adopt usage another machine read (list --json)
+  %(prog)s ingest-statusline          adopt the statusline's rate limits (stdin)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
@@ -1283,6 +1285,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--ingest-statusline",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--tui",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1333,6 +1340,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.export is not None
         or args.import_ is not None
         or args.import_usage is not None
+        or args.ingest_statusline
         or args.add_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
@@ -1412,6 +1420,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")
             sys.exit(130)
+
+    # Runs from a statusline: never prints, never fails, and skips the
+    # update check below (no network).
+    if args.ingest_statusline:
+        from claude_swap.statusline_ingest import run_ingest_statusline
+
+        run_ingest_statusline(debug=args.debug)
+        return
 
     # Initialize switcher and dispatch under a single error handler so
     # init-time failures (e.g. MigrationError on a backup-dir collision)
