@@ -561,6 +561,54 @@ class TestDecisionTable:
         assert switch.trigger == "failover"
         assert harness.active_number() == 2
 
+    def test_failover_skips_candidates_at_or_above_the_threshold(self, temp_home):
+        h = EngineHarness(temp_home, threshold=80.0)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"),
+                           (3, "c@example.com")):
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        # Slot 2 sits exactly at the threshold; slot 3 is below it.
+        usage = {"1": None, "2": _usage(80), "3": _usage(79)}
+        h.tick_with_usage(usage)
+        h.tick_with_usage(usage)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert h.active_number() == 3
+
+    def test_failover_stays_put_when_no_candidate_is_below_the_threshold(
+        self, temp_home
+    ):
+        # The 18:50 incident: the active account's usage went unknown and the
+        # only readable candidate was at the 80% threshold already.
+        h = EngineHarness(temp_home, threshold=80.0)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"),
+                           (3, "c@example.com")):
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        usage = {"1": None, "2": _usage(80), "3": None}
+        h.tick_with_usage(usage)
+        h.tick_with_usage(usage)
+        assert h.tick_with_usage(usage) is TickOutcome.BLOCKED
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "failover-no-target-below-threshold"
+        assert h.active_number() == 1
+
+    def test_at_limit_still_escapes_onto_an_above_threshold_candidate(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=80.0)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage(
+            {"1": _usage(100), "2": _usage(85)}
+        ) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert h.active_number() == 2
+
     def test_unmanaged_live_login_is_never_touched(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

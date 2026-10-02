@@ -33,6 +33,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap.locking import FileLock
@@ -314,6 +315,11 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # Set for an idle slot (not the current login, no live ``cswap run``
+    # session, no live hold): ``last_good`` with every window whose reset has
+    # passed read as reset. Nobody uses an idle account, so its usage cannot
+    # rise and the last reading stays decision-trusted at any age.
+    idle_value: dict | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -392,13 +398,16 @@ class UsageEntry:
     def decision_value(self) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
-        Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        Sentinel wins; else an idle slot's ``idle_value``; else last-good
+        while it is recent enough to trust (≤ ``STALE_OK_S``, or
+        ``trust_extended`` for deliberate staleness); else None (unknown).
+        Display code reads ``last_good``/``age_s`` directly instead — it may
+        show older data, annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
+        if self.idle_value is not None:
+            return self.idle_value
         if (
             self.last_good is not None
             and self.age_s is not None
@@ -498,6 +507,46 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
+
+
+WEEK_S = 7 * 86400.0
+
+
+def _rolled_window(window: object, now: float, period_s: float | None) -> object:
+    """``window`` as it stands at ``now`` on an account nobody has used.
+
+    A passed reset zeroed the window. A weekly window (``period_s``) rolls to
+    its next boundary on the fixed schedule; a 5-hour window only starts again
+    on use, so it has no reset until then.
+    """
+    if not isinstance(window, dict):
+        return window
+    ts = parse_reset_ts(window.get("resets_at"))
+    if ts is None or ts > now:
+        return window
+    rolled = {
+        k: v for k, v in window.items()
+        if k not in ("resets_at", "countdown", "clock")
+    }
+    rolled["pct"] = 0.0
+    if period_s is not None:
+        next_ts = ts + (int((now - ts) // period_s) + 1) * period_s
+        rolled["resets_at"] = datetime.fromtimestamp(
+            next_ts, tz=timezone.utc
+        ).isoformat()
+    return rolled
+
+
+def roll_elapsed_windows(last_good: dict, now: float) -> dict:
+    """An idle account's reading with every passed window reset read as reset."""
+    out = dict(last_good)
+    for key, period in (("five_hour", None), ("seven_day", WEEK_S)):
+        if key in out:
+            out[key] = _rolled_window(out[key], now, period)
+    scoped = out.get("scoped")
+    if isinstance(scoped, list):
+        out["scoped"] = [_rolled_window(w, now, WEEK_S) for w in scoped]
+    return out
 
 
 def _rate_limited_trust_ok(
@@ -887,6 +936,7 @@ class UsageStore:
         self,
         identities: dict[str, Identity],
         models: tuple[str, ...] = (),
+        idle: Iterable[str] = (),
     ) -> dict[str, UsageEntry]:
         """Identity-guarded snapshot for the given slots (empty entry when the
         row is missing or belongs to a different account).
@@ -894,7 +944,14 @@ class UsageStore:
         ``models`` are the configured scoped-window model names; they let the
         429-stale trust bound also honor per-model (e.g. Fable) window resets,
         matching the scheduler's window view. Omitted (``()``) for callers that
-        only read timestamps/last-good and never consult scoped resets."""
+        only read timestamps/last-good and never consult scoped resets.
+
+        ``idle`` names the slots the caller knows nobody is using (not the
+        current login, no live ``cswap run`` session). Their last-good stays
+        decision-trusted past every age ceiling, read with passed window
+        resets applied (``UsageEntry.idle_value``). A slot under a live hold
+        is being fed by a user of the account, so it is never idle here."""
+        idle = set(idle)
         now = self.clock()
         rows = self._read_rows()
         out: dict[str, UsageEntry] = {}
@@ -949,6 +1006,11 @@ class UsageStore:
                     or held
                 )
             )
+            idle_value = (
+                roll_elapsed_windows(last_good, now)
+                if num in idle and not held and isinstance(last_good, dict)
+                else None
+            )
             out[num] = UsageEntry(
                 last_good=last_good if isinstance(last_good, dict) else None,
                 fetched_at=fetched_at,
@@ -966,6 +1028,7 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                idle_value=idle_value,
             )
         return out
 
@@ -1198,6 +1261,13 @@ class UsageStore:
         collection back when it lapses. The latest hold replaces an earlier
         one, so ``hold_s`` 0 lifts it; ``None`` leaves it as it is. Returns
         the slots whose ``lastGood`` was replaced.
+
+        A hold on a slot whose last fetch was a 429 also pushes its backoff
+        to a full block (``Retry-After`` 3600 plus margin) from now. A held
+        account is in use elsewhere, and those clients' requests to the usage
+        endpoint keep the server's block alive past the deadline this store
+        recorded from its own 429; so the hold lapsing must not trigger the
+        first retry.
         """
         if not readings:
             return set()
@@ -1224,6 +1294,11 @@ class UsageStore:
                 held_until = min(held_until, reset_at)
             if held_until > now:
                 row["heldUntil"] = held_until
+                if row.get("lastError") == "http-429":
+                    row["backoffUntil"] = max(
+                        _num_or_none(row.get("backoffUntil")) or 0.0,
+                        now + _failure_backoff_s(1, RECENT_429_WINDOW_S),
+                    )
             else:
                 row.pop("heldUntil", None)
 

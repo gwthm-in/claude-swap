@@ -4287,6 +4287,8 @@ class TestDeadTokenQuarantine:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._poll_inputs_override = (90.0, ("Fable",))
+        # In use through a live session: an idle slot's trust never ends.
+        switcher._live_session_pids = lambda num, email: [4242]
         store = switcher._usage_store
         now = time.time()
 
@@ -12630,3 +12632,49 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestIdleUsageTrust:
+    """Who the collector counts as idle when it reads the usage store."""
+
+    def _collect(self, switcher, is_active: bool, live_pids: list[int]):
+        store = switcher._usage_store
+        ident = {"2": ("idle@example.com", "")}
+        store.record({"2": FetchRecord(usage={
+            "five_hour": {"pct": 65.0}, "seven_day": {"pct": 72.0},
+        })}, ident)
+        store.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+        )
+        with store.path.open() as fh:
+            table = json.load(fh)
+        table["accounts"]["2"]["fetchedAt"] -= 3 * 3600.0
+        store.path.write_text(json.dumps(table))
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": (time.time() + 86400) * 1000,
+        }})
+        info = [(2, "idle@example.com", "Org", "", is_active, creds, "")]
+        switcher._live_session_pids = lambda num, email: live_pids
+        return switcher._collect_usage_entries(info, fetch=set())["2"]
+
+    def test_idle_slot_stays_trusted_past_the_cap(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        entry = self._collect(switcher, is_active=False, live_pids=[])
+        assert entry.age_s > 2 * 3600
+        assert entry.decision_value()["five_hour"]["pct"] == 65.0
+
+    def test_active_slot_is_not_trusted_past_the_cap(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        entry = self._collect(switcher, is_active=True, live_pids=[])
+        assert entry.last_good is not None
+        assert entry.decision_value() is None
+
+    def test_slot_with_a_live_session_is_not_trusted_past_the_cap(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        entry = self._collect(switcher, is_active=False, live_pids=[4242])
+        assert entry.last_good is not None
+        assert entry.decision_value() is None

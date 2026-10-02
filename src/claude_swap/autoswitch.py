@@ -1274,6 +1274,18 @@ class AutoSwitchEngine:
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
+            if not truly_exhausted and trigger == "failover":
+                self._emit(
+                    NoSwitchEvent(
+                        reason="failover-no-target-below-threshold",
+                        detail=(
+                            "active usage is unknown and no candidate is "
+                            f"below the {pct_label(settings.threshold)}% "
+                            "threshold; staying put"
+                        ),
+                    )
+                )
+                return TickOutcome.BLOCKED
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -1835,6 +1847,10 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            if trigger == "failover" and (100.0 - h) >= settings.threshold:
+                # Failover runs blind on the active account, which may well
+                # be fine; a candidate already at the threshold is no escape.
+                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )

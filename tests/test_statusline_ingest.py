@@ -109,6 +109,22 @@ class TestAttribution:
         assert entry.held(time.time())
         assert entry.held_until <= time.time() + FEED_HOLD_S + 5
 
+    def test_feeding_a_429_blocked_slot_keeps_its_hold_lapse_off_the_endpoint(
+        self, two_accounts, temp_home: Path
+    ):
+        s = two_accounts
+        _login_as(temp_home, BOB)
+        s._usage_store.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=60.0)},
+            {"2": BOB},
+        )
+
+        assert ingest_statusline(s, _payload(five=80, seven=74)) == "2"
+
+        entry = _entry(s, "2", BOB)
+        assert entry.held_until is not None
+        assert entry.backoff_until > entry.held_until + 3600
+
     def test_session_profile_maps_to_its_own_slot(
         self, two_accounts, temp_home: Path, monkeypatch
     ):

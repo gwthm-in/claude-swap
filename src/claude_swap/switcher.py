@@ -5470,8 +5470,20 @@ class ClaudeAccountSwitcher:
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        # Idle: neither the current login nor running in a live ``cswap run``
+        # session, so its usage cannot rise and its last reading stays
+        # decision-trusted (see ``UsageStore.entries``). A statusline-fed
+        # account is one of the two by definition, and its hold excludes it
+        # in the store as well.
+        idle = {
+            num
+            for num, info in info_by_num.items()
+            if num not in sentinels
+            and not info[4]
+            and not self._live_session_pids(num, info[1])
+        }
 
-        entries = store.entries(identities, models)
+        entries = store.entries(identities, models, idle)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -5491,7 +5503,7 @@ class ClaudeAccountSwitcher:
                 self._usage_store.clear_dead_token(
                     [num], {num: identities[num]}
                 )
-                entries = store.entries(identities, models)
+                entries = store.entries(identities, models, idle)
         requested = [
             num
             for num in info_by_num
@@ -5554,7 +5566,7 @@ class ClaudeAccountSwitcher:
             for num, record in accepted_records.items():
                 if record.sentinel is not None:
                     sentinels[num] = record.sentinel
-            entries = store.entries(identities, models)
+            entries = store.entries(identities, models, idle)
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
             # so surface "re-login needed" in *this* pass instead of leaving the

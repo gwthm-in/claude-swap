@@ -1845,3 +1845,145 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+
+
+def _iso(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+class TestIdleTrust:
+    """An account nobody is using keeps its last reading decision-trusted."""
+
+    def _aged_429_row(self, store, clock, usage, age_s):
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        clock.advance(age_s)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+
+    def test_idle_reading_outlives_every_age_ceiling(self, store, clock):
+        self._aged_429_row(store, clock, USAGE, RATE_LIMIT_TRUST_MAX_AGE_S + 3600)
+        assert store.entries(IDENT)["1"].decision_value() is None
+        entry = store.entries(IDENT, idle={"1"})["1"]
+        assert entry.decision_value() == USAGE
+        assert entry.last_good == USAGE
+        assert entry.age_s > RATE_LIMIT_TRUST_MAX_AGE_S
+
+    def test_non_429_failure_is_trusted_too_when_idle(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S + 3600)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        assert store.entries(IDENT)["1"].decision_value() is None
+        assert store.entries(IDENT, idle={"1"})["1"].decision_value() == USAGE
+
+    def test_active_or_in_session_slot_is_not_extended(self, store, clock):
+        # The caller leaves a used slot out of ``idle``; nothing changes.
+        self._aged_429_row(store, clock, USAGE, RATE_LIMIT_TRUST_MAX_AGE_S + 1)
+        entries = store.entries(IDENT, idle={"2"})
+        assert entries["1"].idle_value is None
+        assert entries["1"].decision_value() is None
+
+    def test_a_held_slot_is_never_idle(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=300.0)
+        entry = store.entries(IDENT, idle={"1"})["1"]
+        assert entry.idle_value is None
+        clock.advance(301.0)
+        assert store.entries(IDENT, idle={"1"})["1"].idle_value == USAGE
+
+    def test_passed_resets_read_as_reset(self, store, clock):
+        five_reset = clock.now + 3600
+        week_reset = clock.now + 7200
+        scoped_reset = clock.now + 86400 * 10
+        usage = {
+            "five_hour": {"pct": 65.0, "resets_at": _iso(five_reset),
+                          "countdown": "1h", "clock": "19:00"},
+            "seven_day": {"pct": 73.0, "resets_at": _iso(week_reset)},
+            "scoped": [{"name": "Fable", "pct": 40.0,
+                        "resets_at": _iso(scoped_reset)}],
+        }
+        self._aged_429_row(store, clock, usage, 3 * 3600)
+        entry = store.entries(IDENT, ("Fable",), idle={"1"})["1"]
+        value = entry.decision_value()
+        assert value["five_hour"] == {"pct": 0.0}
+        assert value["seven_day"]["pct"] == 0.0
+        assert value["seven_day"]["resets_at"] == _iso(week_reset + 7 * 86400)
+        assert value["scoped"] == usage["scoped"]
+        assert oauth.account_headroom(value, ("Fable",)) == 60.0
+        # Display keeps the measurement as taken.
+        assert entry.last_good == usage
+
+
+class TestHoldDuring429Block:
+    """A statusline hold lapsing must not fetch inside a 429 block."""
+
+    def test_hold_lapse_inside_backoff_does_not_fetch(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(600)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        backoff_until = store.entries(IDENT)["1"].backoff_until
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=300.0)
+        clock.advance(301.0)
+        entries = store.entries(IDENT)
+        assert not entries["1"].held(clock.now)
+        assert entries["1"].in_backoff(clock.now)
+        assert due_candidate(["1"], entries, clock.now) is None
+        for mode in ({"respect_plans": True}, {"respect_plans": False},
+                     {"respect_plans": False, "repair_overslept": True}):
+            assert store.reserve(["1"], IDENT, **mode) == {}
+        assert store.entries(IDENT)["1"].backoff_until >= backoff_until
+
+    def test_feeding_during_a_block_restarts_the_wait(self, store, clock):
+        # 18:08 429 (Retry-After 3600) -> backoffUntil 19:23. The account
+        # was fed 19:21-19:22, and the hold lapsed 19:26:56 with the
+        # server's block re-armed to 20:10. The wait now runs from the last
+        # feed, so the lapse does not reach for the endpoint.
+        t429 = clock.now
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        assert store.entries(IDENT)["1"].backoff_until == t429 + 4500.0
+        clock.advance(4400.0)
+        fed_at = clock.now
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=300.0)
+        clock.advance(306.0)  # hold lapsed, original backoff long past
+        entries = store.entries(IDENT)
+        assert entries["1"].backoff_until == pytest.approx(
+            fed_at + usage_store.RETRY_AFTER_FLOOR_CAP_S
+        )
+        assert due_candidate(["1"], entries, clock.now) is None
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    def test_hold_without_a_429_leaves_backoff_alone(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        before = store.entries(IDENT)["1"].backoff_until
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=300.0)
+        assert store.entries(IDENT)["1"].backoff_until == before
+
+    def test_a_success_clears_the_429_so_holds_stop_extending(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(5000.0)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=300.0)
+        assert store.entries(IDENT)["1"].backoff_until is None
+
+    @pytest.mark.parametrize("retry_after", [2619.0, 3600.0, 4500.0])
+    def test_a_repeat_429_never_waits_less_than_retry_after(
+        self, store, clock, retry_after
+    ):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(4501.0)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=retry_after)},
+            IDENT,
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 2
+        assert entry.backoff_until - clock.now >= retry_after
