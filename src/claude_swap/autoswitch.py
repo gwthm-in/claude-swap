@@ -777,8 +777,10 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
-        if self.switcher.account_is_quotaless(number):
-            return "ok"  # API keys don't expire/refresh
+        if self.switcher.account_is_quotaless(
+            number
+        ) or self.switcher.account_base_url(number):
+            return "ok"  # API keys (a reporting pool's too) don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put

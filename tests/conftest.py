@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import types
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -570,6 +571,24 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_pool_usage_fetch(monkeypatch):
+    """Safety net: no test may ask a real pool's ``/api/oauth/usage``.
+
+    Base-URL API-key accounts now ask their pool for usage on every collect
+    pass, and many surface tests register one at an unresolvable host. The
+    opener answers 404 (an older pool without the endpoint), which keeps
+    those slots on the "metered" sentinel. Tests of the endpoint patch
+    ``claude_swap.oauth._open_pool_usage`` themselves.
+    """
+
+    def _unsupported(req):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr("claude_swap.oauth._open_pool_usage", _unsupported)
     yield
 
 

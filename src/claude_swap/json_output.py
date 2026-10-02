@@ -25,8 +25,9 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
 # Base-URL accounts (``add-token --base-url``) talk to a relay/gateway, not
-# Anthropic: there is no quota to read, and their key must never be sent to
-# Anthropic's usage API, so usage is reported as this sentinel instead.
+# Anthropic: their key must never be sent to Anthropic's usage API, so usage
+# is reported as this sentinel unless the pool reports its own usage (an
+# API-key slot whose pool serves ``<baseUrl>/api/oauth/usage``).
 USAGE_CUSTOM_ENDPOINT = "custom endpoint"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
@@ -222,7 +223,7 @@ def usage_fields(
     automatically — or a live session's credential refused, which only that
     session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
-    ``USAGE_CUSTOM_ENDPOINT`` sentinel (base-URL account, never fetched), the
+    ``USAGE_CUSTOM_ENDPOINT`` sentinel (base-URL account with no pool usage), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the

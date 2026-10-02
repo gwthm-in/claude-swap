@@ -475,6 +475,11 @@ class ClaudeAccountSwitcher:
             tuple[str, str, str, str, str, str], bool
         ] = {}
 
+        # Whether each pool (base-URL API-key slot) had a decision-grade
+        # reading from its own usage endpoint on the last collect pass; see
+        # ``account_is_quotaless``. In-memory, refreshed every pass.
+        self._pool_reporting: dict[str, bool] = {}
+
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
         # lazily to avoid a circular import, and self-contained so it never
@@ -3233,13 +3238,25 @@ class ClaudeAccountSwitcher:
     def account_is_quotaless(self, account_num: str) -> bool:
         """Whether a slot has no subscription quota to watch.
 
-        API-key accounts and base-URL accounts (whatever their credential
-        kind) both qualify: neither has usage cswap can read, and a base-URL
-        account's credential must never be sent to Anthropic to find out.
+        API-key accounts without a base URL always qualify. A base-URL
+        account (whatever its credential kind) qualifies unless it is a pool
+        whose own usage endpoint gave a decision-grade reading on the last
+        collect pass; its credential is never sent to Anthropic to find out.
         """
-        return self._account_kind(account_num) == "api_key" or bool(
-            self._account_base_url(account_num)
-        )
+        num = str(account_num)
+        if not self._account_base_url(num):
+            return self._account_kind(num) == "api_key"
+        return not self._pool_reporting.get(num, False)
+
+    def _pool_usage_url(self, account_num: str, base_url: str) -> str | None:
+        """The usage URL a base-URL slot's pool may be asked, or None.
+
+        Only API-key slots (the pool's own key) over https, or http to a
+        loopback host.
+        """
+        if self._account_kind(account_num) != "api_key":
+            return None
+        return oauth.pool_usage_url(base_url)
 
     def _is_api_key_credential(
         self, credentials: str | None, account_num: str | None
@@ -5258,10 +5275,13 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
-        if self._account_base_url(str(num)):
-            # Relay/gateway account: no quota to read, and its credential
-            # must never be sent to Anthropic's usage API.
-            return USAGE_CUSTOM_ENDPOINT
+        base_url = self._account_base_url(str(num))
+        if base_url:
+            # Relay/gateway account: its credential must never be sent to
+            # Anthropic's usage API. A pool may report its own usage.
+            if self._pool_usage_url(str(num), base_url) is None:
+                return USAGE_CUSTOM_ENDPOINT
+            return None
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5300,6 +5320,10 @@ class ClaudeAccountSwitcher:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+
+        base_url = self._account_base_url(str(num))
+        if base_url:
+            return self._fetch_pool_usage(str(num), email, base_url)
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
@@ -5386,6 +5410,45 @@ class ClaudeAccountSwitcher:
             struck_fp=outcome.struck_fp,
         )
 
+    def _fetch_pool_usage(self, num: str, email: str, base_url: str) -> FetchRecord:
+        """A pool's own usage, asked with the slot's stored key at the slot's
+        own base URL only (never the live credential, never Anthropic)."""
+        if self._pool_usage_url(num, base_url) is None:
+            return FetchRecord(sentinel=USAGE_CUSTOM_ENDPOINT)
+        key = (self._read_account_credentials(num, email) or "").strip()
+        if not key or key.startswith("{"):
+            return FetchRecord(sentinel=USAGE_CUSTOM_ENDPOINT)
+        outcome = oauth.fetch_pool_usage(base_url, key, context=f"for account {num}")
+        return FetchRecord(
+            usage=outcome.usage,
+            error=outcome.error,
+            retry_after_s=outcome.retry_after_s,
+        )
+
+    @staticmethod
+    def _pool_overlay(entry: UsageEntry) -> tuple[str | None, bool]:
+        """``(sentinel, reporting)`` for a pool slot's collected entry.
+
+        Reporting: a decision-grade reading with 5h/7d headroom. Otherwise the
+        slot reads "metered" once the endpoint has been asked and gave nothing
+        usable (unsupported, a failure with no trusted reading to serve, or an
+        empty answer); a pool not yet asked keeps no sentinel, so the
+        scheduler's due-candidate pick still reaches it.
+        """
+        if entry.sentinel is not None:
+            return entry.sentinel, False
+        value = entry.decision_value()
+        if isinstance(value, dict) and oauth.account_headroom(value) is not None:
+            if entry.last_error != oauth.POOL_USAGE_UNSUPPORTED:
+                return None, True
+        if (
+            entry.last_error == oauth.POOL_USAGE_UNSUPPORTED
+            or (entry.last_error is not None and value is None)
+            or (entry.fetched_at is not None and entry.last_good is None)
+        ):
+            return USAGE_CUSTOM_ENDPOINT, False
+        return None, False
+
     def _read_only_fetch(
         self, num: str, email: str, creds: str, rejected_fp: str | None
     ) -> FetchRecord:
@@ -5470,15 +5533,23 @@ class ClaudeAccountSwitcher:
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        pools = {
+            num
+            for num in info_by_num
+            if num not in sentinels and self._account_base_url(num)
+        }
         # Idle: neither the current login nor running in a live ``cswap run``
         # session, so its usage cannot rise and its last reading stays
         # decision-trusted (see ``UsageStore.entries``). A statusline-fed
         # account is one of the two by definition, and its hold excludes it
         # in the store as well.
+        # A pool is never idle: other clients draw on it whatever this machine
+        # does.
         idle = {
             num
             for num, info in info_by_num.items()
             if num not in sentinels
+            and num not in pools
             and not info[4]
             and not self._live_session_pids(num, info[1])
         }
@@ -5536,7 +5607,7 @@ class ClaudeAccountSwitcher:
         # fetch path refreshes the token and the sentinel clears itself.
         now = store.clock()
         for num, info in info_by_num.items():
-            if num in sentinels or not info[4]:  # info[4] = is_active
+            if num in sentinels or num in pools or not info[4]:  # info[4] = is_active
                 continue
             if num in claims:
                 continue  # the fetch path will handle (or sentinel) it now
@@ -5577,6 +5648,18 @@ class ClaudeAccountSwitcher:
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
+
+        for num in pools:
+            if num in sentinels:
+                self._pool_reporting[num] = False
+                continue
+            overlay, reporting = self._pool_overlay(entries[num])
+            self._pool_reporting[num] = reporting
+            if overlay is not None:
+                sentinels[num] = overlay
+        for num in info_by_num:
+            if num not in pools:
+                self._pool_reporting.pop(num, None)
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))

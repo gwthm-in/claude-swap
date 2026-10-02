@@ -381,7 +381,7 @@ A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login 
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
-Accounts registered with `--base-url` carry an additive `baseUrl` on their list row and on the `status --json` active row, with `usageStatus: "custom_endpoint"` and `usage: null`. A switch that changed Claude Code's endpoint adds `"baseUrlChanged": true` to its result, and one that moved the default login between an OAuth account and an API key adds `"restartRequired": true`.
+Accounts registered with `--base-url` carry an additive `baseUrl` on their list row and on the `status --json` active row, with `usageStatus: "custom_endpoint"` and `usage: null` unless their pool reports usage (see [pool usage](#add-an-account-from-a-raw-token-or-api-key)). A switch that changed Claude Code's endpoint adds `"baseUrlChanged": true` to its result, and one that moved the default login between an OAuth account and an API key adds `"restartRequired": true`.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
@@ -435,9 +435,32 @@ switching to a custom-endpoint account is refused and switching elsewhere leaves
 in place. The exception is `https://api.anthropic.com` itself (for example, left
 behind by `cswap purge`): a custom-endpoint account takes it over. Switching between an OAuth login and an API key (in either direction) may
 need running sessions to be restarted to pick up the new login type — the switch
-says so. These accounts show `→ host` in `cswap list` and read `metered` instead of usage
-(`usageStatus: "custom_endpoint"` in JSON), and their key is never sent to Anthropic by cswap (no usage or identity
-lookups). They are treated like API-key accounts by auto-switching.
+says so. These accounts show `→ host` in `cswap list`, and their key is never sent to
+Anthropic by cswap (no usage or identity lookups).
+
+**Pool usage.** For an API-key account with a base URL, cswap asks the endpoint itself
+for usage: `GET <baseUrl>/api/oauth/usage` with the stored key in `x-api-key`. A pool
+that supports it answers in the shape of Anthropic's usage endpoint, describing the
+best account it holds, plus a `pool` object that marks the answer as its own:
+
+```json
+{"five_hour": {"utilization": 42, "resets_at": "2026-10-02T03:00:00Z"},
+ "seven_day": {"utilization": 17, "resets_at": "2026-10-06T00:00:00Z"},
+ "pool": {"eligible": 3, "total": 5, "observedAt": "2026-10-02T01:12:00Z"}}
+```
+
+`utilization` is 0-100 or `null` (that window is then left out); `resets_at` is
+ISO-8601 or `null`. The account then shows 5h/7d like any other, and auto-switch treats
+it as an ordinary candidate with that headroom: it is not switched onto at or above the
+threshold, and is switched off when it reaches the threshold and another account has room.
+The request goes only to the account's own base URL, over https (plain http only to a
+loopback host), and redirects are not followed. A 401, 404 or 405, a redirect, or a
+response without the `pool` object marks the endpoint unsupported for an hour; until it
+answers, or while a failure leaves no recent reading, the account reads `metered`
+(`usageStatus: "custom_endpoint"` in JSON) and auto-switching treats it like an API-key
+account. Setup-token accounts with a base URL always read `metered`. Statusline readings
+(`ingest-statusline`) are never taken for base-URL accounts: whatever rate-limit figures
+a pool passes through describe the upstream account that served the request.
 
 ## Uninstall
 

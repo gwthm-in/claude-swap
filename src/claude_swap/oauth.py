@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -623,6 +625,148 @@ def fetch_usage(access_token: str) -> dict | None:
         kind, _ = _classify_usage_error(e)
         _log_usage_failure("", e, kind)
         return None
+
+
+# A base-URL account's pool (a relay in front of several subscriptions) may
+# serve its own ``/api/oauth/usage``: Anthropic's response shape, describing
+# the best account in the pool, plus a ``pool`` object. It is the pool's own
+# endpoint, never Anthropic's, so it shares no per-account 429 budget.
+POOL_USAGE_PATH = "/api/oauth/usage"
+# An older pool answers these for the path (or for a key it does not accept
+# there); a redirect is refused the same way, since following one would carry
+# the key to another URL.
+POOL_UNSUPPORTED_STATUSES = frozenset({401, 404, 405})
+POOL_USAGE_UNSUPPORTED = "pool-unsupported"
+# How long an unsupported verdict holds before the endpoint is asked again
+# (the store's failure backoff carries it, shared by every surface).
+POOL_UNSUPPORTED_RECHECK_S = 3600.0
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def pool_usage_url(base_url: str) -> str | None:
+    """The pool usage URL under ``base_url``, or None when it may not be asked.
+
+    The key only ever travels over https, except to a loopback host.
+    """
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme != "https" and not (scheme == "http" and _is_loopback_host(host)):
+        return None
+    return base_url.rstrip("/") + POOL_USAGE_PATH
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface a 3xx as an HTTPError instead of re-sending the key elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_pool_usage(req: urllib.request.Request) -> bytes:
+    handlers: list[urllib.request.BaseHandler] = [_RefuseRedirect()]
+    if req.type == "http":
+        # Plain http is loopback-only; an environment proxy would see the key.
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=5) as resp:
+        return resp.read()
+
+
+def request_pool_usage_data(base_url: str, api_key: str) -> dict:
+    """Request raw usage data from a pool's own usage endpoint."""
+    url = pool_usage_url(base_url)
+    if url is None:
+        raise ValueError("pool usage endpoint requires https or a loopback host")
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    return json.loads(_open_pool_usage(req).decode())
+
+
+def build_pool_usage_result(data: object) -> tuple[bool, dict | None]:
+    """``(supported, usage)`` from a pool usage response.
+
+    The ``pool`` object marks the response as the pool's own; without it the
+    answer may come from an upstream account the pool forwarded to, so it is
+    treated as unsupported. Only the 5h/7d windows are kept, and a window
+    whose utilization is null is dropped.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("pool"), dict):
+        return False, None
+    windows: dict = {}
+    for key in ("five_hour", "seven_day"):
+        window = data.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("utilization")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        resets_at = window.get("resets_at")
+        windows[key] = {
+            "utilization": pct,
+            "resets_at": resets_at if isinstance(resets_at, str) else None,
+        }
+    return True, build_usage_result(windows)
+
+
+def fetch_pool_usage(base_url: str, api_key: str, context: str = "") -> UsageOutcome:
+    """Fetch a pool's usage. Never raises; the key is never logged.
+
+    An unsupported endpoint comes back as ``POOL_USAGE_UNSUPPORTED`` with a
+    ``POOL_UNSUPPORTED_RECHECK_S`` retry-after, so the store parks the slot
+    instead of asking an older pool again every pass.
+    """
+    unsupported = UsageOutcome(
+        None,
+        error=POOL_USAGE_UNSUPPORTED,
+        retry_after_s=POOL_UNSUPPORTED_RECHECK_S,
+    )
+    where = f" {context}" if context else ""
+    try:
+        data = request_pool_usage_data(base_url, api_key)
+    except urllib.error.HTTPError as e:
+        if e.code in POOL_UNSUPPORTED_STATUSES or 300 <= e.code < 400:
+            _logger.info(
+                "Pool usage endpoint unsupported%s (http-%d); showing metered",
+                where, e.code,
+            )
+            return unsupported
+        kind, retry_after = _classify_usage_error(e)
+        _log_usage_failure(context, e, kind, retry_after)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    except Exception as e:
+        kind, retry_after = _classify_usage_error(e)
+        _log_usage_failure(context, e, kind, retry_after)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    try:
+        supported, usage = build_pool_usage_result(data)
+    except (TypeError, ValueError) as e:
+        _log_usage_failure(context, e, "bad-response")
+        return UsageOutcome(None, error="bad-response")
+    if not supported:
+        _logger.info(
+            "Pool usage response%s carries no pool object; showing metered",
+            where,
+        )
+        return unsupported
+    return UsageOutcome(usage)
 
 
 # Refresh failures that will not resolve by retrying THIS pass, so the caller

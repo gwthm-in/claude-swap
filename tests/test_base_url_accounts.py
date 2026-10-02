@@ -1064,10 +1064,11 @@ class TestUsageNeverFetched:
     def test_usage_fields_maps_custom_endpoint(self):
         assert usage_fields(USAGE_CUSTOM_ENDPOINT) == ("custom_endpoint", None)
 
-    @pytest.mark.parametrize("token", [POOL_KEY, SETUP_TOKEN])
-    def test_collect_short_circuits(self, temp_home: Path, monkeypatch, token):
+    def test_collect_short_circuits(self, temp_home: Path, monkeypatch):
+        # An OAuth setup-token relay has no pool key to ask with; a pool's
+        # API key is covered by tests/test_pool_usage.py.
         s = _switcher()
-        s.add_account_from_token(token, slot=2, base_url=URL)
+        s.add_account_from_token(SETUP_TOKEN, slot=2, base_url=URL)
         email = _record(s, "2")["email"]
         creds = s._read_account_credentials("2", email)
         monkeypatch.setattr(

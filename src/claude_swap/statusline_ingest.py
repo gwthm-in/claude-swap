@@ -250,7 +250,11 @@ def ingest_statusline(switcher: ClaudeAccountSwitcher, text: str) -> str | None:
             return None
     assert num is not None
 
-    if switcher.account_is_quotaless(num):
+    # A base-URL slot is skipped even when its pool reports usage: any
+    # rate-limit info the pool forwards into Claude Code's statusline
+    # describes whichever upstream account served the request, not the pool.
+    # The pool's own usage endpoint is the only source for that slot.
+    if switcher.account_is_quotaless(num) or switcher.account_base_url(num):
         log.debug("statusline ingest: slot %s has no quota", num)
         return None
 
